@@ -1,0 +1,125 @@
+// 1. Mesh Generation (L=5, H=1)
+mesh th = square(150, 30, [x*5, y]); 
+
+// 2. Spaces & Variables
+fespace Vh(th, P2); 
+Vh u, v, w, T, uu, vv, ww, TT;  
+Vh uold=0, vold=0, wold=0, Told=0; 
+Vh uprev=0, vprev=0, wprev=0, Tprev=0; 
+
+Vh psi, phiT;
+
+fespace Ph(th, P1); 
+Ph p, q;
+
+// 2. Parameters
+real Re = 100.0, K = 0.1, Gr = 1000.0, Pr = 0.71, j = 0.01, gamma = 0.1, dt = 0.05;
+real tol = 1e-5; // Convergence tolerance for the implicit loop
+
+// 3. Fully Implicit Variational Problem
+problem MicropolarFlow([u, v, w, T, p], [uu, vv, ww, TT, q]) =
+    // --- [1] MOMENTUM EQUATIONS (X & Y) ---
+    int2d(th)(
+        (u*uu + v*vv)/dt                                     // Unsteady
+        + (uprev*dx(u) + vprev*dy(u))*uu                     // Implicit Convection X
+        + (uprev*dx(v) + vprev*dy(v))*vv                     // Implicit Convection Y
+        + (1.0/Re + K/Re)*(dx(u)*dx(uu) + dy(u)*dy(uu) 
+                         + dx(v)*dx(vv) + dy(v)*dy(vv))      // Diffusion
+        - p*(dx(uu) + dy(vv))                                // Pressure Gradient
+        - (K/Re)*(dy(w)*uu - dx(w)*vv)                       // Coupling (Spin)
+        - (Gr/(Re*Re))*T*vv                                  // Buoyancy
+    )
+    // --- [2] ANGULAR MOMENTUM (MICROROTATION) ---
+    + int2d(th)(
+        j*(w*ww)/dt                                          // Unsteady
+        + j*(uprev*dx(w) + vprev*dy(w))*ww                   // Implicit Convection
+        + (gamma/Re)*(dx(w)*dx(ww) + dy(w)*dy(ww))           // Spin Diffusion
+        + (2.0*K/Re)*w*ww                                    // Vortex Viscosity
+        - (K/Re)*(dy(u) - dx(v))*ww                          // Coupling (Velocity)
+    )
+    // --- [3] ENERGY EQUATION (TEMPERATURE) ---
+    + int2d(th)(
+        (T*TT)/dt                                            // Unsteady
+        + (uprev*dx(T) + vprev*dy(T))*TT                     // Implicit Convection
+        + (1.0/(Re*Pr))*(dx(T)*dx(TT) + dy(T)*dy(TT))        // Thermal Diffusion
+    )
+    // --- [4] CONTINUITY & PRESSURE STABILITY ---
+    + int2d(th)(
+        q*(dx(u) + dy(v))                                    // Continuity
+        + 1e-10 * p * q                                      // Penalty term
+    )
+    // --- [5] RIGHT HAND SIDE (PREVIOUS TIME STEP) ---
+    - int2d(th)(
+        (uold*uu + vold*vv)/dt + j*(wold*ww)/dt + (Told*TT)/dt
+    )
+    // --- BOUNDARY CONDITIONS ---
+    + on(4, u= 4*y*(1-y) , v=0, w=0, T=0.5) // Inlet 4*y*(1-y)
+    + on(3, u=0, v=0, w=0, T=1.0)         // Top (Hot)
+    + on(1, u=0, v=0, w=0, T=0.0)         // Bottom (Cold)
+    + on(2, p=0);                         // Outlet
+
+
+  problem StreamFunction(psi, phiT) =
+    int2d(th)(
+        dx(psi)*dx(phiT) + dy(psi)*dy(phiT)
+    )
+    - int2d(th)(
+        (dx(v) - dy(u)) * phiT   // vorticity
+    )
+
+    //  Proper boundary conditions
+    + on(1, psi=0)        // Bottom wall
+    + on(3, psi= 2.0/3.0)      // 2.0/3.0
+    + on(4, psi = 2*y^2 - (4.0/3.0)*y^3 )  // 2*y^2 - (4.0/3.0)*y^3
+    + on(2, psi=0);       // Outlet (reference)
+	
+
+// 5. Time Loop with Inner Implicit Iterations
+for (int i=0; i<500; i++) {
+    
+    for (int k=0; k<10; k++) { // Inner loop for Full Implicitness
+        uprev = u; vprev = v; wprev = w; Tprev = T; 
+        
+        MicropolarFlow; // Solve using current 'prev' guesses
+        
+        // Convergence Check
+        real error = sqrt(int2d(th)((u-uprev)^2 + (v-vprev)^2 + (T-Tprev)^2));
+        if (error < tol) break; 
+    }
+
+    uold=u; vold=v; wold=w; Told=T; // Update for next time step
+    StreamFunction;
+
+    // Visualization
+    plot(T, fill=true, WindowIndex=0, cmm="Temperature - Step "+i);
+	plot([u, v], ps=30, WindowIndex=1, cmm="Velocity Vectors - Step "+i);
+    plot(psi, fill=false, nbiso=40, WindowIndex=2, cmm="Streamlines - Step "+i);
+	
+}
+
+
+// 2. TECPLOT EXPORT FILE
+ofstream tec("solution1.dat");
+
+// Header
+tec << "TITLE = \"2D Convection Flow\"" << endl;
+tec << "VARIABLES = \"X\", \"Y\", \"U\", \"V\", \"Psi\", \"T\"" << endl;
+
+// Zone definition: Changed Th to th to match your mesh definition
+tec << "ZONE N=" << th.nv << ", E=" << th.nt << ", F=FEPOINT, ET=TRIANGLE" << endl;
+
+// Write data for each vertex
+for (int i = 0; i < th.nv; i++) {
+    // Accessing mesh vertices and function values at those points
+    tec << th(i).x << " " << th(i).y << " " 
+        << u(th(i).x, th(i).y) << " " 
+        << v(th(i).x, th(i).y) << " " 
+        << psi(th(i).x, th(i).y) << " " 
+        << T(th(i).x, th(i).y) << endl;
+}
+
+// Write connectivity table (the triangles)
+for (int i = 0; i < th.nt; i++) {
+    // Corrected index access: th[i][vertex_index]
+    tec << th[i][0] + 1 << " " << th[i][1] + 1 << " " << th[i][2] + 1 << endl;
+}

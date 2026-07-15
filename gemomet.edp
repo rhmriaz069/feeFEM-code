@@ -1,0 +1,64 @@
+// =====================================================
+// WAVY CHANNEL GEOMETRY  (FreeFEM++)
+// y = ±[1 + a sin(2π n x)]
+// =====================================================
+
+real L     = 2.0;      // channel length
+real a     = 0.1;     // waviness amplitude (small: 0–0.2 recommended)
+int  nWave = 2;        // number of waves
+int  Nx    = 200;      // boundary resolution
+
+func yTop =  1.0 + a*sin(1.5*pi*nWave*x/L);
+func yBot = -1.0 - a*sin(1.5*pi*nWave*x/L);
+
+// -----------------------------------------------------
+// BOUNDARIES
+// -----------------------------------------------------
+
+// bottom wall
+border bottom(t=0,L)
+{
+    x = t;
+    y = -1.0 - a*sin(1.5*pi*nWave*t/L);
+    label = 1;
+}
+
+// outlet
+border outlet(t=-1,1)
+{
+    x = L;
+    y = t;
+    label = 2;
+}
+
+// top wall
+border top(t=L,0)
+{
+    x = t;
+    y =  1.0 + a*sin(1.5*pi*nWave*t/L);
+    label = 3;
+}
+
+// inlet
+border inlet(t=1,-1)
+{
+    x = 0;
+    y = t;
+    label = 4;
+}
+
+// -----------------------------------------------------
+// MESH
+// -----------------------------------------------------
+
+mesh Th = buildmesh(
+    bottom(Nx)
+  + outlet(Nx/4)
+  + top(Nx)
+  + inlet(Nx/4)
+);
+
+// optional refinement near walls
+Th = adaptmesh(Th, 1.0, hmin=0.01, nbvx=80000);
+
+plot(Th, wait=1);

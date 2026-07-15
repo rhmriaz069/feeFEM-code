@@ -1,0 +1,118 @@
+//----------------------------------------------------
+// VISCOPLASTIC + THIXOTROPIC FLOW (FreeFEM++ v4.15)
+// Herschel–Bulkley + Structure Parameter lambda
+//----------------------------------------------------
+
+load "iovtk"
+verbosity = 1;
+
+//---------------- GEOMETRY --------------------------
+real L = 1.0;
+real H = 0.2;
+mesh Th = square(80,16,[L*x, H*y]);
+
+//---------------- FUNCTION SPACES -------------------
+fespace Vh(Th,P2);
+fespace Ph(Th,P1);
+
+// Unknowns
+Vh u, v, uOld, vOld;
+Ph p, pOld;
+
+Vh lambda, lambdaOld;
+Vh gdot, mu;
+
+// Test function
+Vh lamTest;
+
+//---------------- PARAMETERS ------------------------
+real rho = 2000.0;
+real dt  = 1e-3;
+real T   = 0.2;
+
+real tauY0 = 200.0;
+real K     = 50.0;
+real n     = 0.45;
+real eps   = 1e-6;
+
+real a = 0.6;     // build-up
+real b = 2.0;     // breakdown
+
+real gx = 0.0;
+real gy = -9.81;
+
+//---------------- INITIAL CONDITIONS ----------------
+uOld = 0.0;
+vOld = 0.0;
+pOld = 0.0;
+lambdaOld = 1.0;
+
+//---------------- TIME LOOP -------------------------
+real t = 0.0;
+int it = 0;
+
+while (t < T)
+{
+    t += dt;
+    it++;
+
+    //---------------- SHEAR RATE -------------------
+    gdot = sqrt(
+          2*(dx(uOld)^2 + dy(vOld)^2)
+        + (dy(uOld)+dx(vOld))^2
+        + eps^2
+    );
+
+    //---------------- VISCOSITY --------------------
+    mu = (tauY0*lambdaOld)/gdot + K*pow(gdot, n-1);
+
+    //---------------- THIXOTROPY -------------------
+    // (Fully implicit, linear, stable)
+    solve Thixotropy(lambda, lamTest) =
+        int2d(Th)(
+            lambda*lamTest/dt
+          + a*lambda*lamTest
+          + b*gdot*lambda*lamTest
+        )
+      - int2d(Th)(
+            lambdaOld*lamTest/dt
+          + a*lamTest
+        );
+
+    // Enforce physical bounds
+    lambda = max(0.0, min(1.0, lambda));
+
+    //---------------- SIMPLE MOMENTUM (CREEPING) ---
+    solve Momentum([u,v],[uOld,vOld]) =
+        int2d(Th)(
+            2*mu*( dx(u)*dx(uOld)
+                 + dy(v)*dy(vOld)
+                 + 0.5*(dy(u)+dx(v))*(dy(uOld)+dx(vOld)) )
+        )
+      - int2d(Th)(
+            rho*(gx*uOld + gy*vOld)
+        )
+      + on(1,2,3,4, u=0, v=0);
+
+    //---------------- UPDATE -----------------------
+    uOld = u;
+    vOld = v;
+    lambdaOld = lambda;
+
+    //---------------- OUTPUT -----------------------
+    if (it % 10 == 0)
+    {
+        savevtk(
+            "thixoplastic_"+it+".vtk",
+            Th,
+            [u, v],
+            lambda,
+            mu,
+            gdot,
+            dataname = "velocity lambda mu gammadot"
+        );
+
+        cout << "Time = " << t << "  Step = " << it << endl;
+    }
+}
+//---------------- END -------------------------------

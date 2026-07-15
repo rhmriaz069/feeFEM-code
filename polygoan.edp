@@ -1,0 +1,214 @@
+load "iovtk"
+verbosity = 1;
+
+// ================= PARAMETERS =================
+real Pr = 8;
+real Ra = 1e6;
+real Ha = 15.0;
+real Lambda = 1.5;
+real deltaMic = 1.0;
+real dt = 1e-4;
+int nIter = 1500;
+real zeta = 0.25;
+
+// ================= NANOFLUID PROPERTIES =================
+real rhoF = 1020, cpF = 3800, kF = 0.5, muF = 0.005, betaTF = 2.1e-4, sigmaF=2e-5;
+real rhoS = 3970, cpS = 765,  kS = 30, betaTS = 8.5e-6, sigmaS=3.5e7;
+real phi  = 0.01, M = 3.0;
+
+real rhoNF = (1-phi)*rhoF + phi*rhoS;
+real cpNF  = ((1-phi)*rhoF*cpF + phi*rhoS*cpS)/rhoNF;
+real betaTNF = ((1-phi)*rhoF*betaTF + phi*rhoS*betaTS)/rhoNF;
+
+real kNF = kF*(kS+(M-1)*kF-(M-1)*phi*(kF-kS))/(kS+(M-1)*kF+phi*(kF-kS));
+real muNF = muF/pow(1-phi,2.0);
+real sigmaNF = sigmaF*(1+3*phi*(sigmaS/sigmaF-1))/((sigmaS/sigmaF+2)-phi*(sigmaS/sigmaF-1));
+
+real rhoR = rhoNF/rhoF;
+real muR  = muNF/muF;
+real kR   = kNF/kF;
+real rhoCpR = rhoNF*cpNF/(rhoF*cpF);
+real rhoBetaTR = rhoNF*betaTNF/(rhoF*betaTF);
+real sigmaR = sigmaNF/sigmaF;
+
+real visc = Pr*(muR+Lambda)/rhoR;
+real micr = Pr*(muR+Lambda/2.0)/rhoR;
+real therm = kR/rhoCpR;
+
+// ================= GEOMETRY & MESH =================
+border b1(t=0,1){ x=0.2+0.6*t; y=0.1; label=1; }
+border b2(t=0,1){ x=0.8+0.1*t; y=0.1+0.45*t; label=2; }
+border b3(t=0,1){ x=0.9-0.4*t; y=0.55+0.35*t; label=3; }
+border b4(t=0,1){ x=0.5-0.4*t; y=0.9-0.35*t; label=4; }
+border b5(t=0,1){ x=0.1+0.1*t; y=0.55-0.45*t; label=5; }
+
+mesh Th = buildmesh(b1(60)+b2(60)+b3(60)+b4(60)+b5(60));
+real h = Th.hmax;
+
+// ================= FE SPACES =================
+fespace Vh(Th, P2);
+Vh psi, omega, Gamma, theta;
+Vh psiT, omegaT, GammaT, thetaT;
+Vh psiOld, omegaOld, GammaOld, thetaOld;
+Vh u, v, uOld, vOld;
+
+fespace VhP1(Th, P1);
+VhP1 psiP1, omegaP1, GammaP1, thetaP1, uP1, vP1;
+
+
+// Initial Conditions
+theta = y; 
+thetaOld = theta;
+psi = 0; omega = 0; Gamma = 0;
+u = 0; v = 0; uOld = 0; vOld = 0;
+
+// ================= FULLY IMPLICIT PROBLEM =================
+real penalty = 1e10;
+
+problem CoupledSystem(psi, omega, Gamma, theta, psiT, omegaT, GammaT, thetaT) =
+    // 1. Streamfunction: -Lap(psi) = omega
+    int2d(Th)( dx(psi)*dx(psiT) + dy(psi)*dy(psiT) - omega*psiT )
+    + on(1,2,3,4,5, psi=0)
+
+    // 2. Vorticity Equation
+    + int2d(Th)(
+          omega*omegaT/dt
+        + visc*(dx(omega)*dx(omegaT) + dy(omega)*dy(omegaT))
+        + (uOld*dx(omega) + vOld*dy(omega))*omegaT 
+        - (Pr*Lambda/rhoR)*(dx(Gamma)*dx(omegaT) + dy(Gamma)*dy(omegaT))
+        - (Ra*Pr*rhoBetaTR/rhoR)*dx(theta)*omegaT
+        - (sigmaR/rhoR)*Ha^2*Pr*dx(psi)*omegaT 
+    )
+    - int2d(Th)( omegaOld*omegaT/dt )
+    + int1d(Th,1,2,3,4,5)( penalty * (omega + 2.0*psi/h^2) * omegaT ) 
+
+    // 3. Microrotation
+    + int2d(Th)(
+          Gamma*GammaT/dt
+        + micr*(dx(Gamma)*dx(GammaT) + dy(Gamma)*dy(GammaT))
+        + (uOld*dx(Gamma) + vOld*dy(Gamma))*GammaT
+        - (Pr*Lambda*deltaMic/rhoR)*omega*GammaT
+        + (2.0*Pr*Lambda*deltaMic/rhoR)*Gamma*GammaT
+    )
+    - int2d(Th)( GammaOld*GammaT/dt )
+    + int1d(Th,1,2,3,4,5)( penalty * (Gamma + zeta*omega) * GammaT )
+
+    // 4. Energy Equation
+    + int2d(Th)(
+          theta*thetaT/dt
+        + therm*(dx(theta)*dx(thetaT) + dy(theta)*dy(thetaT))
+        + (uOld*dx(theta) + vOld*dy(theta))*thetaT
+    )
+    - int2d(Th)( thetaOld*thetaT/dt )
+    + on(1, theta=1)
+    + on(2,3,4,5, theta=0);
+
+// ================= TIME LOOP =================
+ofstream outPhi("Ra_1e6_Ha_0_IMPLICIT.dat");
+outPhi << "# it NuAvg KEavg PsiMax PsiMin Tavg Eavg Beavg TPC tau_w_avg MCavg\n";
+
+for(int it=0; it<nIter; it++){
+    
+    // Store old values
+    psiOld = psi; omegaOld = omega; GammaOld = Gamma; thetaOld = theta;
+    uOld = u; vOld = v;
+
+    // Solve system
+    CoupledSystem;
+
+    // Update Velocity after solving
+    u = dy(psi);
+    v = -dx(psi);
+
+    // -------- CALCULATIONS --------
+    real A = int2d(Th)(1.0);
+    real NuAvg = int1d(Th,1)((N.x*dx(theta)+N.y*dy(theta))) / int1d(Th,1)(1.0);
+    real Tavg = int2d(Th)(theta)/A;
+    real KEavg = int2d(Th)(0.5*(u^2 + v^2))/A;
+    real PsiMax = psi[].max;
+    real PsiMin = psi[].min;
+
+    // Entropy and Stress
+    real Theta = 1e-4;
+    Vh Eth  = kR*(dx(theta)^2 + dy(theta)^2);
+    Vh Efr  = Theta*muR*(2*dx(u)^2 + 2*dy(v)^2 + (dx(v)+dy(u))^2);
+    Vh Emr  = Theta*((muR+Lambda/2.0)/deltaMic*(dx(Gamma)^2 + dy(Gamma)^2) + Lambda*(omega-2.0*Gamma)^2);
+    Vh Emhd = Theta*sigmaR*Ha^2*(u^2 + v^2);
+
+    real Eavg = int2d(Th)(Eth+Efr+Emr+Emhd)/A;
+    real Beavg = int2d(Th)(Eth)/int2d(Th)(Eth+Efr+Emr+Emhd + 1e-20);
+    real TPC = NuAvg/pow(Eavg + 1e-20, 1.0/3.0);
+
+    real tauWallavg = int1d(Th,1)((muR+Lambda)*(dx(u)*N.x+dy(u)*N.y) - Lambda*Gamma)/int1d(Th,1)(1.0);
+    Vh Mcouple = (muR + Lambda/2.0) * sqrt(dx(Gamma)^2 + dy(Gamma)^2);
+    real MCavg = int2d(Th)(Mcouple)/A;
+
+    outPhi << it << " " << NuAvg << " " << KEavg << " " << PsiMax << " " << PsiMin << " "
+           << Tavg << " " << Eavg << " " << Beavg << " " << TPC << " " << tauWallavg << " " << MCavg << endl;
+
+   // if(it%1==0) cout << "Iteration " << it << " complete. PsiMax: " << PsiMax << "| PsiMin: " << PsiMax <<endl;
+    real UmagMax = 0;
+for (int i=0; i<u[].n; i++){
+    UmagMax = max(UmagMax, sqrt(sqr(u[][i]) + sqr(v[][i])));
+}
+
+// Velocity extrema
+real Umax = u[].max, Umin = u[].min;
+real Vmax = v[].max, Vmin = v[].min;
+
+// Print to console
+cout << "Iteration " << it
+     << " | Area = " << A
+     << " | Umax = " << Umax << " | Umin = " << Umin
+     << " | Vmax = " << Vmax << " | Vmin = " << Vmin
+     << " | |V|max = " << UmagMax
+     << " | PsiMax = " << PsiMax << " | PsiMin = " << PsiMin
+     << " | NuAvg = " << NuAvg
+     << " | KEavg = " << KEavg
+     << " | Eavg = " << Eavg
+     << " | Beavg = " << Beavg
+     << endl;
+
+// Visualization
+    plot(omega, fill=true, WindowIndex=0, cmm="Vorticity - Step "+it);
+	plot(Gamma, fill=true, WindowIndex=1, cmm=" Micropolarity - Step "+it);
+	plot(theta, fill=true, WindowIndex=2, cmm="Temperature - Step "+it);
+	plot([u, v], ps=30, WindowIndex=3, cmm="Velocity Vectors - Step "+it);
+    plot(psi, fill=false, nbiso=40, WindowIndex=4, cmm="Streamlines - Step "+it);
+
+
+
+}
+
+cout << "Simulation Finished Successfully." << endl;
+
+// ================= EXPORT TO TECPLOT =================
+psiP1=psi;
+omegaP1=omega;
+GammaP1=Gamma;
+thetaP1=theta;
+uP1=u;
+vP1=v;
+
+ofstream tec("Ra_1e6_Ha_0_SVIM.dat");
+
+tec << "TITLE=\"Micropolar Nanofluid\"\n";
+tec << "VARIABLES=\"X\",\"Y\",\"U\",\"V\",\"Psi\",\"Omega\",\"Gamma\",\"Theta\"\n";
+tec << "ZONE N="<<Th.nv<<", E="<<Th.nt<<", F=FEPOINT, ET=TRIANGLE\n";
+
+for(int i=0;i<Th.nv;i++)
+    tec << Th(i).x << " "
+        << Th(i).y << " "
+        << uP1[][i] << " "
+        << vP1[][i] << " "
+        << psiP1[][i] << " "
+        << omegaP1[][i] << " "
+        << GammaP1[][i] << " "
+        << thetaP1[][i] << endl;
+
+for(int k=0;k<Th.nt;k++)
+    tec << Th[k][0]+1 << " "
+        << Th[k][1]+1 << " "
+        << Th[k][2]+1 << endl;
+
+cout << "TECPLOT export complete!" << endl;

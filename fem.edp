@@ -1,0 +1,272 @@
+// ==================================================
+// MICROPOLAR NANOFLUID – FREEFEM++ (5-BORDER GEOMETRY)
+// Streamfunction–Vorticity–Microrotation–Energy
+// BCs: U,V=0, Ψ=0, θ=1 or 0, Ω=0, Γ=-ζΩ (weak spin)
+// ==================================================
+
+load "iovtk"
+verbosity = 1;
+
+// ---------- PARAMETERS ----------
+real Pr = 7.0;
+real Ra = 1e4;
+real Ha = 10.0;
+real Lambda = 0.5;
+real delta = 1.0;
+real Ec = 0.0;
+real dt = 1e-3;
+int nIter = 3000;
+real n = 1.0;      // micropolar spin viscosity coefficient
+real zeta = 0.5;   // weak-spin coefficient
+
+// ---------- NANOFUID PROPERTIES ----------
+real rhoF = 1200; real cpF = 3800; real kF = 0.5; real muF = 0.05; real betaTF = 3e-4;
+real rhoS = 3500; real cpS = 800;  real kS = 150; real betaTS = 2e-5;
+real phi  = 0.05; real M = 3.0;
+
+real rhoNF = (1-phi)*rhoF + phi*rhoS;
+real cpNF  = ((1-phi)*rhoF*cpF + phi*rhoS*cpS)/rhoNF;
+real betaTNF = ((1-phi)*rhoF*betaTF + phi*rhoS*betaTS)/rhoNF;
+
+real kNF = kF*(kS+(M-1)*kF-(M-1)*phi*(kF-kS))/(kS+(M-1)*kF+phi*(kF-kS));
+real muNF = muF/pow(1-phi,2.0);
+
+real rhoR     = rhoNF/rhoF;
+real muR      = muNF/muF;
+real kR       = kNF/kF;
+real rhoCpR   = rhoNF*cpNF/(rhoF*cpF);
+real rhoBetaTR = rhoNF*betaTNF/(rhoF*betaTF);
+
+// ---------- MESH GEOMETRY ----------
+border b1(t=0,1){ x=0.2+0.6*t; y=0.1; }  // bottom wall
+border b2(t=0,1){ x=0.8+0.1*t; y=0.1+0.45*t; }
+border b3(t=0,1){ x=0.9-0.4*t; y=0.55+0.35*t; }
+border b4(t=0,1){ x=0.5-0.4*t; y=0.9-0.35*t; }
+border b5(t=0,1){ x=0.1+0.1*t; y=0.55-0.45*t; }
+
+mesh Th = buildmesh(b1(40)+b2(40)+b3(40)+b4(40)+b5(40));
+
+// ---------- FE SPACES ----------
+fespace Vh(Th,P2);
+Vh psi, psiT;
+Vh omega, omegaOld, omegaT;
+Vh Gamma, GammaOld, GammaT;
+Vh theta, thetaOld, thetaT;
+Vh u, v, Phi;
+
+// ---------- INITIAL CONDITIONS ----------
+psi = 0; omega = 0; Gamma = 0; theta = y;
+
+// ---------- TIME LOOP ----------
+for(int it=0; it<nIter; it++)
+{
+    omegaOld = omega; GammaOld = Gamma; thetaOld = theta;
+
+    // ===== STREAMFUNCTION =====
+    solve Stream(psi, psiT) =
+        int2d(Th)(dx(psi)*dx(psiT) + dy(psi)*dy(psiT))
+      - int2d(Th)(omegaOld*psiT)
+      + on(b1,b2,b3,b4,b5, psi=0);
+
+    u = dy(psi); v = -dx(psi);
+
+    // ===== DISSIPATION Φ =====
+    Phi = 2*sqr(dx(u)) + 2*sqr(dy(v)) + sqr(dy(u)+dx(v))
+        + (1+Lambda/2)/delta*(sqr(dx(GammaOld))+sqr(dy(GammaOld)))
+        + Lambda*sqr(omegaOld-2*GammaOld);
+
+    // ===== VORTICITY =====
+    Vh supgOmega = omegaOld + dt*(u*dx(omegaOld)+v*dy(omegaOld));
+    solve Vorticity(omega, omegaT) =
+        int2d(Th)(
+            omega*omegaT/dt
+          + Pr*(muR+Lambda)/rhoR*(dx(omega)*dx(omegaT)+dy(omega)*dy(omegaT))
+          + Ha^2*Pr*omega*omegaT
+        )
+      - int2d(Th)(
+            supgOmega*omegaT/dt
+          - Pr*Lambda*(dx(GammaOld)*dx(omegaT)+dy(GammaOld)*dy(omegaT))
+          - Ra*Pr*rhoBetaTR/rhoR*dx(thetaOld)*omegaT
+        )
+      + on(b1,b2,b3,b4,b5, omega=0);  // Dirichlet BC for wall vorticity
+
+    // ===== MICROROTATION =====
+    Vh supgGamma = GammaOld + dt*(u*dx(GammaOld)+v*dy(GammaOld));
+    solve Micro(Gamma,GammaT) =
+        int2d(Th)(Gamma*GammaT/dt + Pr*(muR*n+Lambda/2)/rhoR*(dx(Gamma)*dx(GammaT)+dy(Gamma)*dy(GammaT))
+                    + 2*Pr*delta/rhoR*Gamma*GammaT)
+      - int2d(Th)(supgGamma*GammaT/dt - Pr*delta/rhoR*omega*GammaT)
+      + on(b1,b2,b3,b4,b5, Gamma=-zeta*omega);
+
+    // ===== ENERGY =====
+    Vh supgTheta = thetaOld + dt*(u*dx(thetaOld)+v*dy(thetaOld));
+    solve Energy(theta, thetaT) =
+        int2d(Th)(theta*thetaT/dt + kR/rhoCpR*(dx(theta)*dx(thetaT)+dy(theta)*dy(thetaT)))
+      - int2d(Th)(supgTheta*thetaT/dt - Pr*Ec*Phi*thetaT)
+      + on(b1, theta=1)
+      + on(b2,b3,b4,b5, theta=0);
+
+    if(it%500==0)
+        cout << "Iter=" << it
+             << " | omega min=" << omega[].min
+             << " max=" << omega[].max << endl;
+}
+
+
+
+
+
+
+// ===================== EXPORT TO TECPLOT =====================
+ofstream tec("micropolar_nanfluid_structured.dat");
+
+int Nx = 300, Ny = 300;
+
+tec << "TITLE=\"Micropolar\"\n";
+tec << "VARIABLES=\"X\" \"Y\" \"U\" \"V\" \"Psi\" \"Omega\" \"Theta\" \"Gamma\"\n";
+tec << "ZONE I=" << Nx << ", J=" << Ny << ", F=POINT\n";
+
+for (int j = 0; j < Ny; j++)
+ for (int i = 0; i < Nx; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nx - 1);
+    real yy = 0.1 + 0.8 * j / (Ny - 1);
+
+    if ( Th(xx, yy).region >= 0 )
+        tec << xx << " " << yy << " "
+            << u(xx,yy) << " "
+            << v(xx,yy) << " "
+            << psi(xx,yy) << " "
+            << omega(xx,yy) << " "
+            << theta(xx,yy) << " "
+            << Gamma(xx,yy) << "\n";
+    else
+        tec << xx << " " << yy << " 0 0 0 0 0 0\n";
+ }
+
+// tec.close();
+
+
+// ===================== EXPORT STRUCTURED VTK =====================
+ofstream vtk("micropolar_nanofluid_structured.vtk");
+
+int Nxvtk = 300;
+int Nyvtk = 300;
+
+// ---- VTK HEADER ----
+vtk << "# vtk DataFile Version 3.0\n";
+vtk << "Micropolar Natural Convection\n";
+vtk << "ASCII\n";
+vtk << "DATASET STRUCTURED_GRID\n";
+vtk << "DIMENSIONS " << Nxvtk << " " << Nyvtk << " 1\n";
+vtk << "POINTS " << Nxvtk*Nyvtk << " float\n";
+
+// ---- GRID POINTS ----
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    vtk << xx << " " << yy << " 0\n";
+ }
+
+// ---- POINT DATA ----
+vtk << "\nPOINT_DATA " << Nxvtk*Nyvtk << "\n";
+
+// ---- VELOCITY VECTOR ----
+vtk << "VECTORS velocity float\n";
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    if ( Th(xx,yy).region >= 0 )
+        vtk << u(xx,yy) << " " << v(xx,yy) << " 0\n";
+    else
+        vtk << "0 0 0\n";
+ }
+
+// ===================== SCALAR: PSI =====================
+vtk << "\nSCALARS psi float 1\n";
+vtk << "LOOKUP_TABLE default\n";
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    if ( Th(xx,yy).region >= 0 )
+        vtk << psi(xx,yy) << "\n";
+    else
+        vtk << "0\n";
+ }
+
+// ===================== SCALAR: OMEGA =====================
+vtk << "\nSCALARS omega float 1\n";
+vtk << "LOOKUP_TABLE default\n";
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    if ( Th(xx,yy).region >= 0 )
+        vtk << omega(xx,yy) << "\n";
+    else
+        vtk << "0\n";
+ }
+
+// ===================== SCALAR: THETA =====================
+vtk << "\nSCALARS theta float 1\n";
+vtk << "LOOKUP_TABLE default\n";
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    if ( Th(xx,yy).region >= 0 )
+        vtk << theta(xx,yy) << "\n";
+    else
+        vtk << "0\n";
+ }
+
+// ===================== SCALAR: GAMMA =====================
+vtk << "\nSCALARS Gamma float 1\n";
+vtk << "LOOKUP_TABLE default\n";
+for (int j = 0; j < Nyvtk; j++)
+ for (int i = 0; i < Nxvtk; i++)
+ {
+    real xx = 0.1 + 0.8 * i / (Nxvtk - 1);
+    real yy = 0.1 + 0.8 * j / (Nyvtk - 1);
+
+    if ( Th(xx,yy).region >= 0 )
+        vtk << Gamma(xx,yy) << "\n";
+    else
+        vtk << "0\n";
+ }
+
+// vtk.close();
+
+cout << "Structured VTK export completed successfully." << endl;
+
+
+
+
+// ===================== PLOT =====================
+
+plot(theta, fill=true, value=true, cmm="Temperature",
+     ps="theta.eps", WindowIndex=1);
+
+plot(Gamma, fill=true, value=true, cmm="Microrotation",
+     ps="gamma.eps", WindowIndex=2);
+
+plot(psi, fill=true, value=true, cmm="Streamfunction",
+     ps="psi.eps", WindowIndex=3);
+
+plot(omega, fill=true, value=true, cmm="Vorticity",
+     ps="omega.eps", WindowIndex=4);
+
+cout << "Close plot windows to exit." << endl;

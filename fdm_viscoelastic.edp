@@ -1,0 +1,288 @@
+// ==========================================================
+// LOG-CONFORMATION OLDROYD-B + SUPG + ENERGY + Crystallization
+// 2D Planar Contraction Example
+// ==========================================================
+
+verbosity = 1;
+
+// =========Geometry ==========
+real YTOP      = 1.0;
+real YBOT      = -1.0;
+real XIN       = 0.0;
+real XOUT      = 10.0;
+real THETADeg  = 15.0;                 // contraction angle (deg)
+real THETARad  = THETADeg * pi / 180.0;
+
+real YCONTOP   = 0.2;
+real YCONBOT   = -0.2;
+real XCONSTART = 5.0;
+
+// contraction length
+real LCON    = (YTOP - YCONTOP) / tan(THETARad);
+real XCONEND = XCONSTART + LCON;
+
+
+// -------------------------------
+// PARAMETERS
+// -------------------------------
+real etaS0  = 1.0;      // solvent viscosity
+real etaP0  = 0.5;      // polymer viscosity
+real lambda = 1.0;      // relaxation time
+real Cp     = 1.0;      // heat capacity
+real kappa  = 0.01;     // thermal conductivity
+real dt     = 0.002;
+int  nstep  = 200;
+
+real rhoMelt  = 1.0;   // melt density
+real rhoCryst = 1.2;   // crystal density
+real rho      = 1.0;    // fallback constant density if rhoField not used
+
+real xi     = 1.0;      // polymer coefficient
+real L      = 1.0;      // latent heat
+
+// Crystallization kinetics parameters
+real nA      = 2.0;     // Avrami exponent
+real eps     = 1e-8;    // safety for log(1-chi)
+func real kTemp(real Tt){ return exp(-1000/(Tt+1e-8)); } // Arrhenius example
+
+// Temperature
+real Tref = 293.0;
+real C1   = 17.44;
+real C2   = 51.6;
+
+// ===============================
+// VERTICES
+// ===============================
+
+real x0 = XIN,       y0 = YBOT;
+real x1 = XCONSTART, y1 = YBOT;
+real x2 = XCONEND,   y2 = YCONBOT;
+real x3 = XOUT,      y3 = YCONBOT;
+real x4 = XOUT,      y4 = YCONTOP;
+real x5 = XCONEND,   y5 = YCONTOP;
+real x6 = XCONSTART, y6 = YTOP;
+real x7 = XIN,       y7 = YTOP;
+
+// ===============================
+// BORDERS (CCW)
+// ===============================
+
+border BOTINLET(t=0,1)       { x=x0+t*(x1-x0); y=y0+t*(y1-y0); label=3; }
+border BOTCONTRACTION(t=0,1) { x=x1+t*(x2-x1); y=y1+t*(y2-y1); label=3; }
+border BOTOUTLET(t=0,1)      { x=x2+t*(x3-x2); y=y2+t*(y3-y2); label=3; }
+
+border RIGHT(t=0,1)          { x=x3+t*(x4-x3); y=y3+t*(y4-y3); label=2; }
+
+border TOPOUTLET(t=0,1)      { x=x4+t*(x5-x4); y=y4+t*(y5-y4); label=3; }
+border TOPCONTRACTION(t=0,1) { x=x5+t*(x6-x5); y=y5+t*(y6-y5); label=3; }
+border TOPINLET(t=0,1)       { x=x6+t*(x7-x6); y=y6+t*(y7-y6); label=3; }
+
+border LEFT(t=0,1)           { x=x7+t*(x0-x7); y=y7+t*(y0-y7); label=1; }
+
+// ===============================
+// BUILD MESH
+// ===============================
+
+mesh Th = buildmesh(
+    BOTINLET(50)
+  + BOTCONTRACTION(50)
+  + BOTOUTLET(50)
+  + RIGHT(50)
+  + TOPOUTLET(50)
+  + TOPCONTRACTION(50)
+  + TOPINLET(50)
+  + LEFT(50)
+);
+
+plot(Th, wait=1, fill=true, cmm="5:1 Planar Contraction Geometry");
+cout << "Geometry OK | LCON = " << LCON << endl;
+
+// -------------------------------
+// FINITE ELEMENT SPACES
+// -------------------------------
+fespace Vh(Th,P2);  // velocity
+fespace Qh(Th,P1);  // pressure
+fespace Sh(Th,P1);  // log-stress
+fespace ThF(Th,P1); // temperature
+
+Vh u1,u2,v1,v2,u1o=0,u2o=0;
+Qh p,q;
+Sh psi11,psi12,psi22;
+Sh psi11o=0,psi12o=0,psi22o=0;
+ThF T,To=Tref, rhoField;
+
+// Crystallization fraction
+ThF chio=0, chi=0;
+ThF dchidT;  
+
+// -------------------------------
+// WLF TEMPERATURE-DEPENDENT VISCOSITY
+// -------------------------------
+func real alphaT(real Tt){
+    real a = pow(10., -C1*(Tt-Tref)/(C2+Tt-Tref));
+    return min(100., max(0.01,a));
+}
+func real etaS(real Tt){ return etaS0*alphaT(Tt); }
+func real etaP(real Tt){ return etaP0*alphaT(Tt); }
+
+// -------------------------------
+// INLET PROFILE
+// -------------------------------
+real H = YTOP-YBOT;
+func uin = 4*(y-YBOT)*(YTOP-y)/(H*H);
+
+// -------------------------------
+// MOMENTUM EQUATIONS
+// -------------------------------
+problem Flow([u1,u2,p],[v1,v2,q]) =
+ int2d(Th)(
+   etaS(To)*( dx(u1)*dx(v1)+dy(u1)*dy(v1)
+            + dx(u2)*dx(v2)+dy(u2)*dy(v2) )
+  - p*(dx(v1)+dy(v2))
+  - q*(dx(u1)+dy(u2))
+ )
+ + int2d(Th)(
+   etaP(To)/lambda * (
+     (exp(psi11)-1.0)*dx(v1)
+   + psi12*(dy(v1)+dx(v2))
+   + (exp(psi22)-1.0)*dy(v2)
+   )
+ )
+ + on(1,u1=uin,u2=0)
+ + on(3,u1=0,u2=0)
+ + on(2,p=0);
+
+// -------------------------------
+// SUPG PARAMETER
+// -------------------------------
+real hK = 1.0/20.0;
+func real tauSUPG(){ return hK/(2*sqrt(u1o^2+u2o^2+1e-8)); }
+
+// -------------------------------
+// LOG-CONFORMATION EQUATIONS
+// -------------------------------
+Sh r;
+
+problem Psi11(psi11,r) =
+ int2d(Th)(
+   psi11/dt*r + u1o*dx(psi11)*r + u2o*dy(psi11)*r
+ + psi11/lambda*r
+ )
+ + int2d(Th)(
+   tauSUPG()*(u1o*dx(psi11)+u2o*dy(psi11))*(u1o*dx(r)+u2o*dy(r))
+ )
+ - int2d(Th)(
+   psi11o/dt*r + 2*dx(u1o)/lambda*r
+ );
+
+problem Psi12(psi12,r) =
+ int2d(Th)(
+   psi12/dt*r + u1o*dx(psi12)*r + u2o*dy(psi12)*r
+ + psi12/lambda*r
+ )
+ + int2d(Th)(
+   tauSUPG()*(u1o*dx(psi12)+u2o*dy(psi12))*(u1o*dx(r)+u2o*dy(r))
+ )
+ - int2d(Th)(
+   psi12o/dt*r + (dy(u1o)+dx(u2o))*r
+ );
+
+problem Psi22(psi22,r) =
+ int2d(Th)(
+   psi22/dt*r + u1o*dx(psi22)*r + u2o*dy(psi22)*r
+ + psi22/lambda*r
+ )
+ + int2d(Th)(
+   tauSUPG()*(u1o*dx(psi22)+u2o*dy(psi22))*(u1o*dx(r)+u2o*dy(r))
+ )
+ - int2d(Th)(
+   psi22o/dt*r + 2*dy(u2o)/lambda*r
+ );
+
+// Stress reconstruction
+Sh tau11 = etaP(To)/lambda*(exp(psi11)-1);
+Sh tau12 = etaP(To)/lambda*psi12;
+Sh tau22 = etaP(To)/lambda*(exp(psi22)-1);
+
+
+// ============ENERGY EQUATION==========
+rhoField = rhoMelt*(1.0 - chio) + rhoCryst*chio;
+
+varf aEnergy(Tvar, r) = int2d(Th)(
+      rhoField*Cp/dt * Tvar * r
+    + kappa * (dx(Tvar)*dx(r) + dy(Tvar)*dy(r))
+);
+
+varf rhsEnergy(Tvar, r) = int2d(Th)(
+      rhoField*Cp/dt * To * r
+    - rhoField*Cp*(u1o*dx(To) + u2o*dy(To)) * r
+    - etaS(To)/2.0 * ( sqr(dx(u1o)) + sqr(dy(u2o)) + 0.5*sqr(dx(u2o)+dy(u1o)) ) * r
+    - xi*etaP(To)/lambda * ( (exp(psi11o)-1)*dx(u1o) 
+                           + psi12o*(dx(u2o)+dy(u1o)) 
+                           + (exp(psi22o)-1)*dy(u2o) ) * r
+    - rhoField*L*dchidT * r
+);
+
+matrix Aenergy = aEnergy(ThF, ThF);           
+real[int] benergy = rhsEnergy(0, ThF);        
+
+real[int] Tsol = Aenergy^-1 * benergy;
+T[] = Tsol;
+
+  
+  // ===================== TIME LOOP =====================
+for(int it = 0; it < nstep; it++)
+{
+    // 1️⃣ Momentum + log-conformation
+    Flow;
+    Psi11; Psi12; Psi22;
+
+    // Crystallization kinetics
+    dchidT =
+    kTemp(To)
+  * nA
+  * max(0.0, 1.0 - chio)
+  * pow(
+        max(0.0, -log(max(1e-10, 1.0 - chio))),
+        (nA - 1.0)/nA
+    );
+
+
+    rhoField = rhoMelt*(1.0 - chio) + rhoCryst*chio;
+
+    // 3️⃣ ENERGY SOLVE (CORRECT varf USAGE)
+    matrix Aenergy = aEnergy(ThF, ThF);
+    real[int] benergy = rhsEnergy(0, ThF);
+
+    T[] = Aenergy^-1 * benergy;
+
+    // 4️⃣ Update previous variables
+    u1o = u1;  u2o = u2;
+    psi11o = psi11;
+    psi12o = psi12;
+    psi22o = psi22;
+    To = T;
+
+    chio[] += dt * dchidT[];
+
+for (int i = 0; i < chio[].n; i++)
+{
+    chio[][i] = min(1.0, max(0.0, chio[][i]));
+}
+
+
+    // 5️⃣ Output
+    if(it % 20 == 0)
+    {
+        cout << "Step " << it
+             << " | max(u) = " << u1[].max
+             << " | max(T) = " << T[].max
+             << " | max(chi) = " << chio[].max
+             << endl;
+
+        plot(T, wait=0, cmm="Temperature");
+        plot(chio, wait=0, cmm="Crystallization");
+    }
+}
+
+cout << "Simulation finished successfully." << endl;

@@ -1,0 +1,192 @@
+// ============================================================
+// Hybrid Casson Nanofluid – FreeFEM++
+// Fully corrected, stable, version-safe
+// Works on ALL FreeFEM versions
+// ============================================================
+
+verbosity = 1;
+load "iovtk";
+
+// ============================================================
+// MESH
+// ============================================================
+real Lx = 4.0, Ly = 4.0;
+int nx = 80, ny = 80;
+
+mesh Th = square(nx,ny,[Lx*x,Ly*y]);
+
+// square labels:
+// 1 bottom, 2 right, 3 top, 4 left
+
+
+// ============================================================
+// FE SPACE
+// ============================================================
+fespace Vh(Th,P2);
+
+Vh u,uOld;
+Vh T,TOld;
+Vh C,COld;
+Vh q;
+
+
+// ============================================================
+// TIME + MODEL PARAMETERS
+// ============================================================
+real dt   = 1e-4;
+real tMax = 1.5;
+real t1   = 0.5;
+real alpha = 0.2;
+
+real Gr=5, Gm=5, M=1, Kp=0.5;
+real Ra=0.5, Pr=3, Sc=0.6, Kr=1;
+
+
+// ============================================================
+// BASE FLUID (water)
+// ============================================================
+real rhoF=997, muF=0.001, kF=0.613, cpF=4182;
+
+
+// ============================================================
+// PARTICLES
+// ============================================================
+real rhoP1=2250, kP1=5000, cpP1=710;
+real rhoP2=5180, kP2=9.7,  cpP2=670;
+
+real phi1=0.02, phi2=0.02;
+
+
+// ============================================================
+// HYBRID PROPERTIES
+// ============================================================
+real rhoHNF = (1-phi1-phi2)*rhoF + phi1*rhoP1 + phi2*rhoP2;
+
+real cpHNF =
+((1-phi1-phi2)*rhoF*cpF + phi1*rhoP1*cpP1 + phi2*rhoP2*cpP2)/rhoHNF;
+
+real muHNF = muF/pow((1-phi1-phi2),2.5);
+
+real kHNF =
+kF*((kP1+2*kF-2*phi1*(kF-kP1))/(kP1+2*kF+phi1*(kF-kP1)))
+ *((kP2+2*kF-2*phi2*(kF-kP2))/(kP2+2*kF+phi2*(kF-kP2)));
+
+real muR = muHNF/muF;
+real kR  = kHNF/kF;
+
+
+// ============================================================
+// PARAMETRIC Et VALUES
+// ============================================================
+real[int] EtVals = [0.1,1,3,5,7,10];
+
+cout << "\n---------------------------------------------\n";
+cout << "Et      Nu_avg      Sh_avg      Eg_avg    Be_avg\n";
+cout << "---------------------------------------------\n";
+
+
+// ============================================================
+// LOOP OVER Et
+// ============================================================
+for(int kEt=0;kEt<EtVals.n;kEt++)
+{
+    real Et = EtVals[kEt];
+
+    uOld=0; TOld=0; COld=0;
+
+    real time=0;
+
+    // ========================================================
+    // TIME LOOP
+    // ========================================================
+    while(time < tMax)
+    {
+        real inlet  = sin(alpha*time);
+        real Tinlet = (time<t1) ? time/t1 : 1.0;
+        real Cinlet = Tinlet;
+
+
+        // ================= MOMENTUM =================
+        problem momentum(u,q)
+            = int2d(Th)(
+                  u*q/dt
+                + (1+1/Et)*muR*(dx(u)*dx(q)+dy(u)*dy(q))
+                + (1/Kp)*(1+1/Et)*muR*u*q
+                + M*u*q
+                + 1e-10*u*q
+              )
+            - int2d(Th)(
+                  uOld*q/dt
+                + Gr*TOld*q
+                + Gm*COld*q
+              )
+            + on(4,u=inlet)
+            + on(1,2,3,u=0);
+
+        momentum;
+
+
+        // ================= TEMPERATURE =================
+        problem energy(T,q)
+            = int2d(Th)(
+                  T*q/dt
+                + ((1+Ra)/Pr)*kR*(dx(T)*dx(q)+dy(T)*dy(q))
+                + 1e-10*T*q
+              )
+            - int2d(Th)(TOld*q/dt)
+            + on(4,T=Tinlet)
+            + on(1,2,3,T=0);
+
+        energy;
+
+
+        // ================= CONCENTRATION =================
+        problem species(C,q)
+            = int2d(Th)(
+                  C*q/dt
+                + (1/Sc)*(dx(C)*dx(q)+dy(C)*dy(q))
+                + Kr*C*q
+                + 1e-10*C*q
+              )
+            - int2d(Th)(COld*q/dt)
+            + on(4,C=Cinlet)
+            + on(1,2,3,C=0);
+
+        species;
+
+
+        uOld=u;
+        TOld=T;
+        COld=C;
+
+        time += dt;
+    }
+
+
+    // ========================================================
+    // POST PROCESS
+    // ========================================================
+    real Nu = int1d(Th,4)(-dy(T)) / int1d(Th,4)(1.0);
+    real Sh = int1d(Th,4)(-dy(C)) / int1d(Th,4)(1.0);
+
+    Vh Eg = kR*(dx(T)^2+dy(T)^2) + muR*(dx(u)^2+dy(u)^2);
+
+    real EgAvg = int2d(Th)(Eg) / int2d(Th)(1.0);
+
+    Vh Sheat = kR*(dx(T)^2+dy(T)^2);
+
+    real BeAvg = int2d(Th)(Sheat/(Eg+1e-12)) / int2d(Th)(1.0);
+
+
+    cout << Et << "     "
+         << Nu << "     "
+         << Sh << "     "
+         << EgAvg << "     "
+         << BeAvg << endl;
+
+
+    savevtk("solution_Et"+Et+".vtk",Th,u,T,C);
+}
+
+cout << "---------------------------------------------\n";
+cout << "Finished successfully.\n";

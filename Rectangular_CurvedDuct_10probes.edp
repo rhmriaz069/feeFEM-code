@@ -1,0 +1,840 @@
+// ======================================================================
+// RECTANGULAR CURVED DUCT - WITH 10 STRATEGIC PROBE POINTS
+// + KINETIC ENERGY, HYDRAULIC RESISTANCE COEFFICIENT, ENTROPY
+//   GENERATION AND BEJAN NUMBER POST-PROCESSING
+// ======================================================================
+// NOTE: The governing equations (Axial, Vorticity, Stream, Energy) are
+// UNCHANGED from the original model. Only the number of probe points
+// (25 -> 10) and the post-processing block have been modified/extended.
+// ======================================================================
+
+load "iovtk"
+load "UMFPACK64"
+
+// ======================================================================
+// PARAMETERS
+// ======================================================================
+
+real delta = 0.1;
+real Dn    = 500.0;
+real Gr    = 500.0;
+real Pr    = 7.0;
+
+real dt    = 0.005;
+real tmax  = 0.1;
+
+real tol   = 1.e-6;
+real relax = 0.7;
+
+// --- Entropy generation parameters ---
+// Irreversibility distribution ratio (ratio of viscous to thermal
+// entropy generation contribution). Adjust according to your
+// non-dimensionalization (Br/Omega type parameter).
+real Phi = 1.0e-3;
+
+// ======================================================================
+// MESH
+// ======================================================================
+
+int n = 80;
+
+border b1(t=-1,1){x=t;  y=-1; label=1;}
+border b2(t=-1,1){x=1;  y=t;  label=2;} // outer wall (cold)
+border b3(t=1,-1){x=t; y=1;   label=3;}
+border b4(t=1,-1){x=-1; y=t;  label=4;} // inner wall (hot)
+
+mesh Th = buildmesh(b1(n) + b2(n) + b3(n) + b4(n));
+
+cout << "Mesh created with " << Th.nv << " vertices and " << Th.nt << " triangles" << endl;
+
+// ======================================================================
+// FE SPACES
+// ======================================================================
+
+fespace Vh(Th,P1);
+
+Vh W, Wold, Wk;
+Vh Psi, PsiOld, PsiK;
+Vh Zeta, ZetaOld, ZetaK;
+Vh Theta, ThetaOld, ThetaK;
+Vh phi;
+Vh U, V, Mag;
+
+// --- New post-processing fields ---
+Vh KE;        // local kinetic energy field (secondary flow), 0.5*(U^2+V^2)
+Vh NsThermal; // local thermal entropy generation number
+Vh NsFriction;// local frictional (viscous) entropy generation number
+Vh NsTotal;   // local total entropy generation number
+Vh BeLocal;   // local Bejan number field
+
+// ======================================================================
+// INITIAL CONDITIONS
+// ======================================================================
+
+W     = 0.0;
+Psi   = 0.0;
+Zeta  = 0.0;
+Theta = (1.0 - x)/2.0;
+U     = 0.0;
+V     = 0.0;
+Mag   = 0.0;
+KE    = 0.0;
+NsThermal  = 0.0;
+NsFriction = 0.0;
+NsTotal    = 0.0;
+BeLocal    = 0.0;
+
+Wold     = W;
+PsiOld   = Psi;
+ZetaOld  = Zeta;
+ThetaOld = Theta;
+
+// ======================================================================
+// 10 STRATEGIC PROBE POINTS DEFINITION
+// ======================================================================
+// Format: [X, Y, ID, Name, Description]
+// Reduced from 25 to 10 probes, keeping coverage of: inner wall,
+// outer wall, geometric center, vertical centerline (top/bottom),
+// and the four secondary-flow vortex cores.
+
+int nProbes = 10;
+
+real[int] probeX(10);
+real[int] probeY(10);
+string[int] probeName(10);
+string[int] probeDesc(10);
+
+probeX[0] = -1.0;  probeY[0] =  0.0;  probeName[0] = "P01"; probeDesc[0] = "InnerWall_Center";
+probeX[1] = -0.6;  probeY[1] =  0.0;  probeName[1] = "P02"; probeDesc[1] = "Inner_Mid";
+probeX[2] =  0.0;  probeY[2] =  0.0;  probeName[2] = "P03"; probeDesc[2] = "Geometric_Center";
+probeX[3] =  0.6;  probeY[3] =  0.0;  probeName[3] = "P04"; probeDesc[3] = "Outer_Mid";
+probeX[4] =  1.0;  probeY[4] =  0.0;  probeName[4] = "P05"; probeDesc[4] = "OuterWall_Center";
+probeX[5] =  0.0;  probeY[5] = -0.6;  probeName[5] = "P06"; probeDesc[5] = "Bottom_Mid";
+probeX[6] =  0.0;  probeY[6] =  0.6;  probeName[6] = "P07"; probeDesc[6] = "Top_Mid";
+probeX[7] = -0.6;  probeY[7] = -0.6;  probeName[7] = "P08"; probeDesc[7] = "Bottom_Inner_Vortex";
+probeX[8] = -0.6;  probeY[8] =  0.6;  probeName[8] = "P09"; probeDesc[8] = "Top_Inner_Vortex";
+probeX[9] =  0.6;  probeY[9] = -0.6;  probeName[9] = "P10"; probeDesc[9] = "Bottom_Outer_Vortex";
+
+// Arrays to store probe values
+real[int] Wprobe(nProbes);
+real[int] Psiprobe(nProbes);
+real[int] Thetaprobe(nProbes);
+real[int] Uprobe(nProbes);
+real[int] Vprobe(nProbes);
+real[int] Magprobe(nProbes);
+real[int] KEprobe(nProbes);
+real[int] NsThermalProbe(nProbes);
+real[int] NsFrictionProbe(nProbes);
+real[int] NsTotalProbe(nProbes);
+real[int] BeProbe(nProbes);
+
+// ======================================================================
+// TIME AVERAGING
+// ======================================================================
+
+real NuInSum = 0.0;
+real NuOutSum = 0.0;
+real WmeanSum = 0.0;
+real KEtotSum = 0.0;
+real lambdaSum = 0.0;
+real SgenTotSum = 0.0;
+real BeAvgSum = 0.0;
+int sampleCount = 0;
+real sampleStart = tmax * 0.7;
+
+// Arrays for time-averaged probe data
+real[int] WprobeAvg(nProbes);
+real[int] PsiprobeAvg(nProbes);
+real[int] ThetaprobeAvg(nProbes);
+real[int] UprobeAvg(nProbes);
+real[int] VprobeAvg(nProbes);
+real[int] MagprobeAvg(nProbes);
+real[int] KEprobeAvg(nProbes);
+real[int] NsTotalProbeAvg(nProbes);
+real[int] BeProbeAvg(nProbes);
+
+// Initialize averaging arrays
+for(int i=0; i<nProbes; i++) {
+    WprobeAvg[i] = 0.0;
+    PsiprobeAvg[i] = 0.0;
+    ThetaprobeAvg[i] = 0.0;
+    UprobeAvg[i] = 0.0;
+    VprobeAvg[i] = 0.0;
+    MagprobeAvg[i] = 0.0;
+    KEprobeAvg[i] = 0.0;
+    NsTotalProbeAvg[i] = 0.0;
+    BeProbeAvg[i] = 0.0;
+}
+
+// ======================================================================
+// OUTPUT FILES
+// ======================================================================
+
+// File for ALL per-timestep global data in one place (merged from the
+// previously duplicated TimeSeriesData.txt / PerformanceData.txt /
+// EntropyAndEnergyData.txt into a single file)
+ofstream timeStepData("TimeStepData.txt");
+timeStepData << "# Time Wmax PsiMax SecMax NuIn NuOut NuAvg Lambda Wmean KEtot SgenThermalTot SgenFrictionTot SgenTotal BeAvg" << endl;
+
+// Files for EACH probe point, written separately (10 files total)
+// Header includes the probe's fixed X,Y location and description.
+ofstream probeFile1("Probe_P01_InnerWall_Center.txt");
+probeFile1 << "# Probe P01 InnerWall_Center  X=" << probeX[0] << " Y=" << probeY[0] << endl;
+probeFile1 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile2("Probe_P02_Inner_Mid.txt");
+probeFile2 << "# Probe P02 Inner_Mid  X=" << probeX[1] << " Y=" << probeY[1] << endl;
+probeFile2 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile3("Probe_P03_Geometric_Center.txt");
+probeFile3 << "# Probe P03 Geometric_Center  X=" << probeX[2] << " Y=" << probeY[2] << endl;
+probeFile3 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile4("Probe_P04_Outer_Mid.txt");
+probeFile4 << "# Probe P04 Outer_Mid  X=" << probeX[3] << " Y=" << probeY[3] << endl;
+probeFile4 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile5("Probe_P05_OuterWall_Center.txt");
+probeFile5 << "# Probe P05 OuterWall_Center  X=" << probeX[4] << " Y=" << probeY[4] << endl;
+probeFile5 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile6("Probe_P06_Bottom_Mid.txt");
+probeFile6 << "# Probe P06 Bottom_Mid  X=" << probeX[5] << " Y=" << probeY[5] << endl;
+probeFile6 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile7("Probe_P07_Top_Mid.txt");
+probeFile7 << "# Probe P07 Top_Mid  X=" << probeX[6] << " Y=" << probeY[6] << endl;
+probeFile7 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile8("Probe_P08_Bottom_Inner_Vortex.txt");
+probeFile8 << "# Probe P08 Bottom_Inner_Vortex  X=" << probeX[7] << " Y=" << probeY[7] << endl;
+probeFile8 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile9("Probe_P09_Top_Inner_Vortex.txt");
+probeFile9 << "# Probe P09 Top_Inner_Vortex  X=" << probeX[8] << " Y=" << probeY[8] << endl;
+probeFile9 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+ofstream probeFile10("Probe_P10_Bottom_Outer_Vortex.txt");
+probeFile10 << "# Probe P10 Bottom_Outer_Vortex  X=" << probeX[9] << " Y=" << probeY[9] << endl;
+probeFile10 << "# Time W Psi Theta U V Mag KE NsTh NsFr NsTot Be" << endl;
+
+// File for time-averaged probe data
+ofstream probeAvgData("ProbeData_TimeAveraged.txt");
+probeAvgData << "# Time-Averaged Data (t = " << sampleStart << " to " << tmax << ")" << endl;
+probeAvgData << "# ID Name X Y Description W_avg Psi_avg Theta_avg U_avg V_avg Mag_avg KE_avg NsTot_avg Be_avg" << endl;
+
+// File for centerline profile (X-direction at Y=0)
+ofstream centerlineProfile("CenterlineProfile.txt");
+centerlineProfile << "# X Y W Psi Theta U V Mag KE NsTot Be" << endl;
+
+// File for vertical line profile (Y-direction at X=0)
+ofstream verticalProfile("VerticalProfile.txt");
+verticalProfile << "# X Y W Psi Theta U V Mag KE NsTot Be" << endl;
+
+// File for probe point summary (easy reading)
+ofstream probeSummary("ProbeSummary.txt");
+probeSummary << "# PROBE POINTS SUMMARY" << endl;
+probeSummary << "# ID | X | Y | Name | Description" << endl;
+for(int i=0; i<nProbes; i++) {
+    probeSummary << i+1 << " | " << probeX[i] << " | " << probeY[i]
+                 << " | " << probeName[i] << " | " << probeDesc[i] << endl;
+}
+
+// (EntropyAndEnergyData.txt removed — merged into TimeStepData.txt above)
+
+// ======================================================================
+// TECPLOT ASCII CONTOUR FILE
+// (velocity, streamline/Psi, vorticity/Zeta, isotherm/Theta,
+//  axial velocity/W, secondary velocity U,V,Mag, KE, entropy, Bejan)
+// One file, multiple zones (one per saved time) so it can be animated
+// directly in Tecplot.
+// ======================================================================
+ofstream tecFile("CurvedDuct_AllFields_Tecplot.dat");
+tecFile << "TITLE = \"Curved Duct - All Fields\"" << endl;
+tecFile << "VARIABLES = \"X\",\"Y\",\"W\",\"Psi\",\"Zeta\",\"Theta\",\"U\",\"V\",\"Mag\",\"KE\",\"NsTotal\",\"Be\"" << endl;
+
+// ======================================================================
+// FUNCTION TO INTERPOLATE VALUES AT PROBE POINTS
+// ======================================================================
+
+func int updateProbePoints() {
+    for(int i=0; i<nProbes; i++) {
+        real xx = probeX[i];
+        real yy = probeY[i];
+
+        Wprobe[i] = W(xx, yy);
+        Psiprobe[i] = Psi(xx, yy);
+        Thetaprobe[i] = Theta(xx, yy);
+        Uprobe[i] = U(xx, yy);
+        Vprobe[i] = V(xx, yy);
+        Magprobe[i] = sqrt(Uprobe[i]^2 + Vprobe[i]^2);
+        KEprobe[i] = KE(xx, yy);
+        NsThermalProbe[i] = NsThermal(xx, yy);
+        NsFrictionProbe[i] = NsFriction(xx, yy);
+        NsTotalProbe[i] = NsTotal(xx, yy);
+        BeProbe[i] = BeLocal(xx, yy);
+    }
+    return 0;
+}
+
+// ======================================================================
+// FUNCTION TO UPDATE TIME AVERAGES
+// ======================================================================
+
+func int updateTimeAverages() {
+    for(int i=0; i<nProbes; i++) {
+        WprobeAvg[i] += Wprobe[i];
+        PsiprobeAvg[i] += Psiprobe[i];
+        ThetaprobeAvg[i] += Thetaprobe[i];
+        UprobeAvg[i] += Uprobe[i];
+        VprobeAvg[i] += Vprobe[i];
+        MagprobeAvg[i] += Magprobe[i];
+        KEprobeAvg[i] += KEprobe[i];
+        NsTotalProbeAvg[i] += NsTotalProbe[i];
+        BeProbeAvg[i] += BeProbe[i];
+    }
+    return 0;
+}
+
+// ======================================================================
+// FUNCTION TO WRITE PROBE DATA
+// ======================================================================
+
+func int writeProbeData(real time) {
+    probeFile1  << time << " " << Wprobe[0]  << " " << Psiprobe[0]  << " " << Thetaprobe[0]
+                << " " << Uprobe[0]  << " " << Vprobe[0]  << " " << Magprobe[0]
+                << " " << KEprobe[0] << " " << NsThermalProbe[0] << " " << NsFrictionProbe[0]
+                << " " << NsTotalProbe[0] << " " << BeProbe[0] << endl;
+
+    probeFile2  << time << " " << Wprobe[1]  << " " << Psiprobe[1]  << " " << Thetaprobe[1]
+                << " " << Uprobe[1]  << " " << Vprobe[1]  << " " << Magprobe[1]
+                << " " << KEprobe[1] << " " << NsThermalProbe[1] << " " << NsFrictionProbe[1]
+                << " " << NsTotalProbe[1] << " " << BeProbe[1] << endl;
+
+    probeFile3  << time << " " << Wprobe[2]  << " " << Psiprobe[2]  << " " << Thetaprobe[2]
+                << " " << Uprobe[2]  << " " << Vprobe[2]  << " " << Magprobe[2]
+                << " " << KEprobe[2] << " " << NsThermalProbe[2] << " " << NsFrictionProbe[2]
+                << " " << NsTotalProbe[2] << " " << BeProbe[2] << endl;
+
+    probeFile4  << time << " " << Wprobe[3]  << " " << Psiprobe[3]  << " " << Thetaprobe[3]
+                << " " << Uprobe[3]  << " " << Vprobe[3]  << " " << Magprobe[3]
+                << " " << KEprobe[3] << " " << NsThermalProbe[3] << " " << NsFrictionProbe[3]
+                << " " << NsTotalProbe[3] << " " << BeProbe[3] << endl;
+
+    probeFile5  << time << " " << Wprobe[4]  << " " << Psiprobe[4]  << " " << Thetaprobe[4]
+                << " " << Uprobe[4]  << " " << Vprobe[4]  << " " << Magprobe[4]
+                << " " << KEprobe[4] << " " << NsThermalProbe[4] << " " << NsFrictionProbe[4]
+                << " " << NsTotalProbe[4] << " " << BeProbe[4] << endl;
+
+    probeFile6  << time << " " << Wprobe[5]  << " " << Psiprobe[5]  << " " << Thetaprobe[5]
+                << " " << Uprobe[5]  << " " << Vprobe[5]  << " " << Magprobe[5]
+                << " " << KEprobe[5] << " " << NsThermalProbe[5] << " " << NsFrictionProbe[5]
+                << " " << NsTotalProbe[5] << " " << BeProbe[5] << endl;
+
+    probeFile7  << time << " " << Wprobe[6]  << " " << Psiprobe[6]  << " " << Thetaprobe[6]
+                << " " << Uprobe[6]  << " " << Vprobe[6]  << " " << Magprobe[6]
+                << " " << KEprobe[6] << " " << NsThermalProbe[6] << " " << NsFrictionProbe[6]
+                << " " << NsTotalProbe[6] << " " << BeProbe[6] << endl;
+
+    probeFile8  << time << " " << Wprobe[7]  << " " << Psiprobe[7]  << " " << Thetaprobe[7]
+                << " " << Uprobe[7]  << " " << Vprobe[7]  << " " << Magprobe[7]
+                << " " << KEprobe[7] << " " << NsThermalProbe[7] << " " << NsFrictionProbe[7]
+                << " " << NsTotalProbe[7] << " " << BeProbe[7] << endl;
+
+    probeFile9  << time << " " << Wprobe[8]  << " " << Psiprobe[8]  << " " << Thetaprobe[8]
+                << " " << Uprobe[8]  << " " << Vprobe[8]  << " " << Magprobe[8]
+                << " " << KEprobe[8] << " " << NsThermalProbe[8] << " " << NsFrictionProbe[8]
+                << " " << NsTotalProbe[8] << " " << BeProbe[8] << endl;
+
+    probeFile10 << time << " " << Wprobe[9]  << " " << Psiprobe[9]  << " " << Thetaprobe[9]
+                << " " << Uprobe[9]  << " " << Vprobe[9]  << " " << Magprobe[9]
+                << " " << KEprobe[9] << " " << NsThermalProbe[9] << " " << NsFrictionProbe[9]
+                << " " << NsTotalProbe[9] << " " << BeProbe[9] << endl;
+
+    return 0;
+}
+
+// ======================================================================
+// FUNCTION TO WRITE PROFILES
+// ======================================================================
+
+func int writeProfiles(real time) {
+    // Centerline profile (Y=0, X from -1 to 1)
+    centerlineProfile << "# Profile at t = " << time << endl;
+    for(real x=-1.0; x<=1.0; x+=0.05) {
+        real y = 0.0;
+        centerlineProfile << x << " " << y << " "
+                         << W(x,y) << " " << Psi(x,y) << " "
+                         << Theta(x,y) << " " << U(x,y) << " "
+                         << V(x,y) << " " << sqrt(U(x,y)^2+V(x,y)^2) << " "
+                         << KE(x,y) << " " << NsTotal(x,y) << " " << BeLocal(x,y) << endl;
+    }
+    centerlineProfile << endl << endl;
+
+    // Vertical profile (X=0, Y from -1 to 1)
+    verticalProfile << "# Profile at t = " << time << endl;
+    for(real y=-1.0; y<=1.0; y+=0.05) {
+        real x = 0.0;
+        verticalProfile << x << " " << y << " "
+                       << W(x,y) << " " << Psi(x,y) << " "
+                       << Theta(x,y) << " " << U(x,y) << " "
+                       << V(x,y) << " " << sqrt(U(x,y)^2+V(x,y)^2) << " "
+                       << KE(x,y) << " " << NsTotal(x,y) << " " << BeLocal(x,y) << endl;
+    }
+    verticalProfile << endl << endl;
+    return 0;
+}
+
+// ======================================================================
+// FUNCTION TO WRITE A TECPLOT ZONE (ALL FIELDS, FE TRIANGLE MESH)
+// Appends one zone (tagged with the solution time) so Tecplot can
+// animate the whole sequence of saved snapshots.
+// ======================================================================
+
+func int writeTecplotZone(real time) {
+    tecFile << "ZONE T=\"t=" << time << "\", SOLUTIONTIME=" << time
+            << ", STRANDID=1, NODES=" << Th.nv << ", ELEMENTS=" << Th.nt
+            << ", DATAPACKING=POINT, ZONETYPE=FETRIANGLE" << endl;
+    for(int i=0; i<Th.nv; i++) {
+        tecFile << Th(i).x << " " << Th(i).y << " "
+                << W[][i] << " " << Psi[][i] << " " << Zeta[][i] << " "
+                << Theta[][i] << " " << U[][i] << " " << V[][i] << " "
+                << Mag[][i] << " " << KE[][i] << " " << NsTotal[][i] << " "
+                << BeLocal[][i] << endl;
+    }
+    for(int k=0; k<Th.nt; k++) {
+        tecFile << Th[k][0]+1 << " " << Th[k][1]+1 << " " << Th[k][2]+1 << endl;
+    }
+    return 0;
+}
+
+// ======================================================================
+// FUNCTION TO PRINT PROBE VALUES TO SCREEN
+// ======================================================================
+
+func int printProbeValues(real time) {
+    cout << "\n========== PROBE POINT VALUES at t = " << time << " ==========" << endl;
+    cout << "ID  Name    X     Y     W        Psi      Theta    U        V        Mag      KE       NsTot    Be" << endl;
+    cout << "-----------------------------------------------------------------------------------------------" << endl;
+    for(int i=0; i<nProbes; i++) {
+        cout << i+1 << "  " << probeName[i] << "  "
+             << probeX[i] << " " << probeY[i] << "  "
+             << Wprobe[i] << " " << Psiprobe[i] << " " << Thetaprobe[i] << " "
+             << Uprobe[i] << " " << Vprobe[i] << " " << Magprobe[i] << " "
+             << KEprobe[i] << " " << NsTotalProbe[i] << " " << BeProbe[i] << endl;
+    }
+    cout << "=================================================================================================" << endl;
+    return 0;
+}
+
+// ======================================================================
+// TIME LOOP
+// ======================================================================
+
+int nsteps = floor(tmax/dt);
+real Wmean, lambda, NuAvg, PsiMax, SecMax, NuIn, NuOut;
+real WmaxVal, TmaxVal;
+real KEtot, SgenThermalTot, SgenFrictionTot, SgenTotalGlobal, BeAvgGlobal;
+real Area;
+
+cout << "\n=========================================================" << endl;
+cout << "STARTING TIME INTEGRATION" << endl;
+cout << "=========================================================" << endl;
+cout << "Total steps: " << nsteps << ", dt = " << dt << endl;
+cout << "Number of probe points: " << nProbes << endl;
+cout << "Averaging starts at t = " << sampleStart << endl;
+cout << "=========================================================" << endl;
+
+for(int step=0; step<=nsteps; step++)
+{
+    real time = step*dt;
+
+    Wk     = Wold;
+    PsiK   = PsiOld;
+    ZetaK  = ZetaOld;
+    ThetaK = ThetaOld;
+
+    for(int iter=0; iter<20; iter++)
+    {
+        // ==============================================================
+//                 AXIAL VELOCITY EQUATION
+// ==============================================================
+solve Axial(W, phi, solver=UMFPACK) =
+    int2d(Th)( (1.0+delta*x)/dt * W * phi
+             + (1.0+delta*x) * (dx(W)*dx(phi) + dy(W)*dy(phi))
+             + (dy(PsiK)*dx(W) - dx(PsiK)*dy(W)) * phi
+             + (delta/(1.0+delta*x)) * dy(PsiK) * W * phi
+			 + delta* dx(W)* phi
+             + (delta*delta/(1.0+delta*x)) * W * phi )
+  - int2d(Th)( (1.0+delta*x)/dt * Wold * phi + Dn * phi )
+  + on(1,2,3,4, W=0);
+
+// ==============================================================
+//                        VORTICITY EQUATION  
+// ==============================================================
+solve Vorticity(Zeta, phi, solver=UMFPACK) =
+    int2d(Th)( (1.0+delta*x)/dt * Zeta * phi
+             + (dx(Zeta)*dy(PsiK) - dy(Zeta)*dx(PsiK)) * phi
+             - (delta/(1.0+delta*x)) * dy(PsiK) * Zeta * phi
+             + (1.0+delta*x) * (dx(Zeta)*dx(phi) + dy(Zeta)*dy(phi))
+             + (delta*delta/(1.0+delta*x)) * Zeta * phi )
+  + int2d(Th) (delta* dx(Zeta)* phi)
+  - int2d(Th)( (1.0+delta*x)/dt * ZetaOld * phi
+             - Wk * dy(Wk) * phi
+             + (1.0+delta*x) * Gr * dx(ThetaK) * phi )
+  + on(1,2,3,4, Zeta=0);
+
+// ==============================================================
+//                      STREAM FUNCTION
+// ==============================================================
+solve Stream(Psi, phi, solver=UMFPACK) =
+    int2d(Th)( dx(Psi)*dx(phi) + dy(Psi)*dy(phi)
+             + (delta/(1.0+delta*x)) * dx(Psi) * phi )
+  - int2d(Th)( (1.0+delta*x) * Zeta * phi )
+  + on(1,2,3,4, Psi=0);
+
+// ==============================================================
+//                        ENERGY EQUATION
+// ==============================================================
+solve Energy(Theta, phi, solver=UMFPACK) =
+    int2d(Th)( (1.0/dt) * Theta * phi
+             + (1.0/(1.0+delta*x)) * (dy(PsiK)*dx(Theta) - dx(PsiK)*dy(Theta)) * phi
+             + (1.0/Pr) * (dx(Theta)*dx(phi) + dy(Theta)*dy(phi))
+             - (1.0/Pr) * (delta/(1.0+delta*x)) * dx(Theta) * phi )
+  - int2d(Th)( (1.0/dt) * ThetaOld * phi )
+  + on(4, Theta=1.0)
+  + on(2, Theta=0.0);
+
+
+        // ==============================================================
+        // CONVERGENCE CHECK
+        // ==============================================================
+        real errW = sqrt(int2d(Th)( (W-Wk)^2 ));
+        real errP = sqrt(int2d(Th)( (Psi-PsiK)^2 ));
+        real errT = sqrt(int2d(Th)( (Theta-ThetaK)^2 ));
+        real err = max(errW, max(errP, errT));
+
+        Wk[]     = relax * W[] + (1.-relax) * Wk[];
+        PsiK[]   = relax * Psi[] + (1.-relax) * PsiK[];
+        ZetaK[]  = relax * Zeta[] + (1.-relax) * ZetaK[];
+        ThetaK[] = relax * Theta[] + (1.-relax) * ThetaK[];
+
+        if(err < tol) break;
+    }
+
+    Wold     = W;
+    PsiOld   = Psi;
+    ZetaOld  = Zeta;
+    ThetaOld = Theta;
+
+    // ==============================================================
+    // SECONDARY FLOW VELOCITIES  (UNCHANGED)
+    // ==============================================================
+    U = (1.0/(1.0+delta*x)) * dy(Psi);
+    V = -(1.0/(1.0+delta*x)) * dx(Psi);
+    Mag = sqrt(U^2 + V^2);
+
+    // ==============================================================
+    // NUSSELT NUMBERS  (UNCHANGED)
+    // ==============================================================
+    NuIn  = 0.5 * int1d(Th,4)( -dx(Theta) );
+    NuOut = 0.5 * int1d(Th,2)( -dx(Theta) );
+
+    // ==============================================================
+    // MEAN AXIAL VELOCITY AND HYDRAULIC RESISTANCE COEFFICIENT
+    // (UNCHANGED, lambda is the friction/hydraulic resistance
+    //  coefficient already present in the original model)
+    // ==============================================================
+    Area = int2d(Th)(1.0);
+    real WmeanDim = int2d(Th)(W) / Area;
+    Wmean = WmeanDim * sqrt(2.0*delta);
+    lambda = (4.0 * sqrt(2.0*delta) * Dn) / (Wmean * Wmean);
+    NuAvg = 0.5 * (NuIn + abs(NuOut));
+
+    WmaxVal = W[].max;
+    TmaxVal = Theta[].max;
+    PsiMax  = Psi[].max;
+    SecMax  = Mag[].max;
+
+    // ==============================================================
+    // POST-PROCESSING: KINETIC ENERGY FIELD
+    // KE = 0.5*(U^2 + V^2)  -> kinetic energy of secondary flow motion
+    // ==============================================================
+    KE = 0.5 * (U^2 + V^2);
+    KEtot = int2d(Th)( KE );  // domain-integrated (total) kinetic energy
+
+    // ==============================================================
+    // POST-PROCESSING: LOCAL ENTROPY GENERATION AND BEJAN NUMBER
+    // Thermal irreversibility:
+    //   Ns_th  = (dTheta/dx)^2 + (dTheta/dy)^2
+    // Frictional (viscous) irreversibility (curvilinear metric terms
+    // consistent with the (1+delta*x) curvature factor used above):
+    //   Ns_fr  = Phi * [ 2*(dU/dx)^2 + 2*(dV/dy)^2 + (dU/dy+dV/dx)^2 ]
+    // Total entropy generation number:
+    //   Ns_tot = Ns_th + Ns_fr
+    // Local Bejan number:
+    //   Be = Ns_th / Ns_tot   (Be -> 1 : heat-transfer dominated,
+    //                          Be -> 0 : fluid-friction dominated)
+    // ==============================================================
+    NsThermal  = dx(Theta)^2 + dy(Theta)^2;
+    NsFriction = Phi * ( 2.0*dx(U)^2 + 2.0*dy(V)^2 + (dy(U)+dx(V))^2 );
+    NsTotal    = NsThermal + NsFriction;
+    BeLocal    = NsThermal / (NsTotal + 1.0e-12);  // small eps avoids /0
+
+    SgenThermalTot  = int2d(Th)( NsThermal );
+    SgenFrictionTot = int2d(Th)( NsFriction );
+    SgenTotalGlobal = SgenThermalTot + SgenFrictionTot;
+    BeAvgGlobal     = SgenThermalTot / (SgenTotalGlobal + 1.0e-12);
+
+    // ==============================================================
+    // UPDATE PROBE POINTS DATA
+    // ==============================================================
+    updateProbePoints();
+
+    // ==============================================================
+    // WRITE INSTANTANEOUS PROBE DATA (EVERY SINGLE TIME STEP)
+    // ==============================================================
+    writeProbeData(time);
+
+    // ==============================================================
+    // WRITE PROFILES (every 200 steps)
+    // ==============================================================
+    if(step % 200 == 0 && step > 0) {
+        writeProfiles(time);
+        writeTecplotZone(time);
+    }
+
+    // ==============================================================
+    // TIME AVERAGING
+    // ==============================================================
+    if(time >= sampleStart) {
+        NuInSum    += NuIn;
+        NuOutSum   += NuOut;
+        WmeanSum   += Wmean;
+        KEtotSum   += KEtot;
+        lambdaSum  += lambda;
+        SgenTotSum += SgenTotalGlobal;
+        BeAvgSum   += BeAvgGlobal;
+        updateTimeAverages();
+        sampleCount++;
+    }
+
+    // ==============================================================
+    // WRITE GLOBAL DATA (single merged per-timestep file)
+    // ==============================================================
+    timeStepData << time << " "
+                 << WmaxVal << " " << PsiMax << " " << SecMax << " "
+                 << NuIn << " " << NuOut << " " << NuAvg << " "
+                 << lambda << " " << Wmean << " "
+                 << KEtot << " " << SgenThermalTot << " " << SgenFrictionTot << " "
+                 << SgenTotalGlobal << " " << BeAvgGlobal << endl;
+
+    // ==============================================================
+    // SCREEN OUTPUT WITH PROBE POINTS
+    // ==============================================================
+    if(step % 100 == 0)
+    {
+        cout << "\n---------------------------------------------------------" << endl;
+        cout << "t = " << time << " | Step = " << step << " of " << nsteps << endl;
+        cout << "---------------------------------------------------------" << endl;
+        cout << "Wmax = " << WmaxVal << " | PsiMax = " << PsiMax << " | SecMax = " << SecMax << endl;
+        cout << "NuIn = " << NuIn << " | NuOut = " << NuOut << " | NuAvg = " << NuAvg << endl;
+        cout << "Lambda = " << lambda << " | Wmean = " << Wmean << endl;
+        cout << "KEtot = " << KEtot << " | SgenTot = " << SgenTotalGlobal << " | BeAvg = " << BeAvgGlobal << endl;
+        cout << "---------------------------------------------------------" << endl;
+        cout << "KEY PROBE POINTS:" << endl;
+        cout << "  P03 (Center)       : W = " << Wprobe[2] << ", Theta = " << Thetaprobe[2] << ", Be = " << BeProbe[2] << endl;
+        cout << "  P01 (Inner Wall)   : W = " << Wprobe[0] << ", Theta = " << Thetaprobe[0] << ", Be = " << BeProbe[0] << endl;
+        cout << "  P05 (Outer Wall)   : W = " << Wprobe[4] << ", Theta = " << Thetaprobe[4] << ", Be = " << BeProbe[4] << endl;
+        cout << "  P08 (Inner Vortex) : W = " << Wprobe[7] << ", KE = " << KEprobe[7] << endl;
+        cout << "  P10 (Outer Vortex) : W = " << Wprobe[9] << ", KE = " << KEprobe[9] << endl;
+        cout << "---------------------------------------------------------" << endl;
+
+        // ==========================================================
+        // LIVE PLOT WINDOWS (one field per window, updated live)
+        // ==========================================================
+        plot(W,        fill=1, value=1, nbiso=20, wait=0, WindowIndex=0, cmm="Axial Velocity W, t="+time);
+        plot(Psi,      fill=1, value=1, nbiso=20, wait=0, WindowIndex=1, cmm="Stream Function Psi, t="+time);
+        plot(Zeta,     fill=1, value=1, nbiso=20, wait=0, WindowIndex=2, cmm="Vorticity Zeta, t="+time);
+        plot(Theta,    fill=1, value=1, nbiso=20, wait=0, WindowIndex=3, cmm="Temperature Theta, t="+time);
+        plot(Mag,      fill=1, value=1, nbiso=20, wait=0, WindowIndex=4, cmm="Secondary Flow Magnitude, t="+time);
+        plot(KE,       fill=1, value=1, nbiso=20, wait=0, WindowIndex=5, cmm="Kinetic Energy, t="+time);
+        plot(NsTotal,  fill=1, value=1, nbiso=20, wait=0, WindowIndex=6, cmm="Total Entropy Generation, t="+time);
+        plot(BeLocal,  fill=1, value=1, nbiso=20, wait=0, WindowIndex=7, cmm="Bejan Number, t="+time);
+        plot([U,V],    coef=0.05, wait=0, WindowIndex=8, cmm="Secondary Flow Vectors, t="+time);
+    }
+
+    // Print full probe table every 500 steps
+    if(step % 500 == 0 && step > 0) {
+        printProbeValues(time);
+    }
+}
+
+// ======================================================================
+// COMPUTE TIME-AVERAGED PROBE DATA
+// ======================================================================
+
+if(sampleCount > 0) {
+    for(int i=0; i<nProbes; i++) {
+        WprobeAvg[i] /= sampleCount;
+        PsiprobeAvg[i] /= sampleCount;
+        ThetaprobeAvg[i] /= sampleCount;
+        UprobeAvg[i] /= sampleCount;
+        VprobeAvg[i] /= sampleCount;
+        MagprobeAvg[i] /= sampleCount;
+        KEprobeAvg[i] /= sampleCount;
+        NsTotalProbeAvg[i] /= sampleCount;
+        BeProbeAvg[i] /= sampleCount;
+    }
+}
+
+// Write time-averaged probe data
+for(int i=0; i<nProbes; i++) {
+    probeAvgData << i+1 << " "
+                 << probeName[i] << " "
+                 << probeX[i] << " "
+                 << probeY[i] << " "
+                 << probeDesc[i] << " "
+                 << WprobeAvg[i] << " "
+                 << PsiprobeAvg[i] << " "
+                 << ThetaprobeAvg[i] << " "
+                 << UprobeAvg[i] << " "
+                 << VprobeAvg[i] << " "
+                 << MagprobeAvg[i] << " "
+                 << KEprobeAvg[i] << " "
+                 << NsTotalProbeAvg[i] << " "
+                 << BeProbeAvg[i] << endl;
+}
+
+// ======================================================================
+// FINAL TIME-AVERAGED RESULTS
+// ======================================================================
+
+real NuInAvg, NuOutAvg, WmeanAvg, lambdaAvg, NuAvgAvg;
+real KEtotAvg, SgenTotAvg, BeAvgFinal;
+
+if (sampleCount > 0) {
+    NuInAvg    = NuInSum / sampleCount;
+    NuOutAvg   = NuOutSum / sampleCount;
+    WmeanAvg   = WmeanSum / sampleCount;
+    KEtotAvg   = KEtotSum / sampleCount;
+    SgenTotAvg = SgenTotSum / sampleCount;
+    BeAvgFinal = BeAvgSum / sampleCount;
+} else {
+    cout << "WARNING: sampleCount=0. Using final-step values instead." << endl;
+    NuInAvg    = NuIn;
+    NuOutAvg   = NuOut;
+    WmeanAvg   = Wmean;
+    KEtotAvg   = KEtot;
+    SgenTotAvg = SgenTotalGlobal;
+    BeAvgFinal = BeAvgGlobal;
+}
+
+lambdaAvg = (4.0 * sqrt(2.0*delta) * Dn) / (WmeanAvg * WmeanAvg);
+NuAvgAvg  = 0.5 * (NuInAvg + abs(NuOutAvg));
+
+// ======================================================================
+// FINAL OUTPUT
+// ======================================================================
+
+cout << "\n\n";
+cout << "################################################################" << endl;
+cout << "                    SIMULATION COMPLETED                        " << endl;
+cout << "################################################################" << endl;
+cout << "\n========== TIME-AVERAGED PERFORMANCE PARAMETERS ==========" << endl;
+cout << "Averaging period: t = " << sampleStart << " to " << tmax << endl;
+cout << "Number of samples: " << sampleCount << endl;
+cout << "-----------------------------------------------------------" << endl;
+cout << "Mean axial velocity         <W>     = " << WmeanAvg << endl;
+cout << "Hydraulic resistance coeff  lambda  = " << lambdaAvg << endl;
+cout << "Inner Nusselt number        NuIn    = " << NuInAvg << endl;
+cout << "Outer Nusselt number        NuOut   = " << NuOutAvg << endl;
+cout << "Average Nusselt number      NuAvg   = " << NuAvgAvg << endl;
+cout << "Total kinetic energy        KEtot   = " << KEtotAvg << endl;
+cout << "Total entropy generation    Sgen    = " << SgenTotAvg << endl;
+cout << "Average Bejan number        Be      = " << BeAvgFinal << endl;
+cout << "-----------------------------------------------------------" << endl;
+
+cout << "\n========== TIME-AVERAGED PROBE POINT DATA ==========" << endl;
+cout << "ID  Name    X     Y     Description            W_avg     Theta_avg   KE_avg    Be_avg" << endl;
+cout << "-----------------------------------------------------------------------------------" << endl;
+for(int i=0; i<nProbes; i++) {
+    cout << i+1 << "  " << probeName[i] << "  "
+         << probeX[i] << " " << probeY[i] << "  "
+         << probeDesc[i] << " "
+         << WprobeAvg[i] << "  " << ThetaprobeAvg[i] << "  "
+         << KEprobeAvg[i] << "  " << BeProbeAvg[i] << endl;
+}
+cout << "=========================================================" << endl;
+
+// ======================================================================
+// SAVE VTK
+// ======================================================================
+
+savevtk("CurvedDuct_solution.vtu", Th, W, Psi, Zeta, Theta, U, V, Mag, KE, NsTotal, BeLocal,
+        dataname="AxialVelocity StreamFunction Vorticity Temperature Uvelocity Vvelocity SecondaryMagnitude KineticEnergy EntropyGenTotal BejanNumber");
+
+// ======================================================================
+// WRITE FINAL TECPLOT ZONE (converged / last time step)
+// ======================================================================
+
+writeTecplotZone(tmax);
+
+// ======================================================================
+// SAVE FINAL DATA
+// ======================================================================
+
+ofstream finalData("final_solution_data.txt");
+finalData << "# Final solution parameters" << endl;
+finalData << "Dn = " << Dn << endl;
+finalData << "Gr = " << Gr << endl;
+finalData << "Pr = " << Pr << endl;
+finalData << "delta = " << delta << endl;
+finalData << "Phi (irreversibility ratio) = " << Phi << endl;
+finalData << "Wmean = " << WmeanAvg << endl;
+finalData << "Lambda = " << lambdaAvg << endl;
+finalData << "NuIn = " << NuInAvg << endl;
+finalData << "NuOut = " << NuOutAvg << endl;
+finalData << "NuAvg = " << NuAvgAvg << endl;
+finalData << "KEtot_avg = " << KEtotAvg << endl;
+finalData << "SgenTot_avg = " << SgenTotAvg << endl;
+finalData << "BeAvg = " << BeAvgFinal << endl;
+finalData << "Wcenter_avg = " << WprobeAvg[2] << endl;
+finalData << "Tcenter_avg = " << ThetaprobeAvg[2] << endl;
+finalData << "W_inner_wall_avg = " << WprobeAvg[0] << endl;
+finalData << "W_outer_wall_avg = " << WprobeAvg[4] << endl;
+
+cout << "\n========== OUTPUT FILES GENERATED ==========" << endl;
+cout << "1. TimeStepData.txt              - ALL per-timestep global data in ONE file" << endl;
+cout << "                                    (Wmax, PsiMax, SecMax, NuIn, NuOut, NuAvg," << endl;
+cout << "                                     Lambda, Wmean, KEtot, SgenThermal, SgenFriction," << endl;
+cout << "                                     SgenTotal, BeAvg)" << endl;
+cout << "2. Probe_P01..P10_*.txt           - 10 SEPARATE files, one per probe point," << endl;
+cout << "                                    each with EVERY time step (t=0,0.005,0.010,...)" << endl;
+cout << "3. ProbeData_TimeAveraged.txt    - Time-averaged probe data" << endl;
+cout << "4. ProbeSummary.txt              - List of all probe points" << endl;
+cout << "5. CenterlineProfile.txt         - X-direction profile at Y=0" << endl;
+cout << "6. VerticalProfile.txt           - Y-direction profile at X=0" << endl;
+cout << "7. CurvedDuct_AllFields_Tecplot.dat - Tecplot ASCII file (FETRIANGLE zones)," << endl;
+cout << "                                    importable directly into Tecplot, containing" << endl;
+cout << "                                    W, Psi (streamline), Zeta (vorticity), Theta" << endl;
+cout << "                                    (isotherm), U, V (secondary velocity), Mag," << endl;
+cout << "                                    KE, NsTotal, Be as separate contour variables," << endl;
+cout << "                                    with one zone per saved time (animatable)." << endl;
+cout << "8. CurvedDuct_solution.vtu       - VTK file for visualization (incl. KE, Sgen, Be, Zeta)" << endl;
+cout << "9. final_solution_data.txt       - Summary of results" << endl;
+cout << "==============================================" << endl;
+
+// ======================================================================
+// FINAL PLOTS (one field per window)
+// ======================================================================
+
+plot(W,        fill=1, value=1, nbiso=30, wait=0, WindowIndex=0, cmm="Final Axial Velocity W");
+plot(Psi,      fill=1, value=1, nbiso=30, wait=0, WindowIndex=1, cmm="Final Stream Function Psi");
+plot(Zeta,     fill=1, value=1, nbiso=30, wait=0, WindowIndex=2, cmm="Final Vorticity Zeta");
+plot(Theta,    fill=1, value=1, nbiso=30, wait=0, WindowIndex=3, cmm="Final Temperature Theta");
+plot(Mag,      fill=1, value=1, nbiso=30, wait=0, WindowIndex=4, cmm="Final Secondary Flow Magnitude");
+plot(KE,       fill=1, value=1, nbiso=30, wait=0, WindowIndex=5, cmm="Final Kinetic Energy");
+plot(NsTotal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=6, cmm="Final Total Entropy Generation");
+plot(BeLocal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=7, cmm="Final Bejan Number");
+plot([U,V],    coef=0.05, wait=1, WindowIndex=8, cmm="Final Secondary Flow Vectors");
