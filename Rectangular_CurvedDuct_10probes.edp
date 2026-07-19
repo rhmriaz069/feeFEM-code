@@ -2,12 +2,10 @@
 // RECTANGULAR CURVED DUCT - WITH 10 STRATEGIC PROBE POINTS
 // + KINETIC ENERGY, HYDRAULIC RESISTANCE COEFFICIENT, ENTROPY
 //   GENERATION AND BEJAN NUMBER POST-PROCESSING
+// GSTU CFD LAB @1 ,BD
+// Author : Riaz Hossain, Soykot Deb, Md. Abusaleh Molla,
+// Most. Rabita Jahan Puspita,  Muhammad Minarul Islam, 
 // ======================================================================
-// NOTE: The governing equations (Axial, Vorticity, Stream, Energy) are
-// UNCHANGED from the original model. Only the number of probe points
-// (25 -> 10) and the post-processing block have been modified/extended.
-// ======================================================================
-
 load "iovtk"
 load "UMFPACK64"
 
@@ -20,16 +18,12 @@ real Dn    = 500.0;
 real Gr    = 500.0;
 real Pr    = 7.0;
 
-real dt    = 0.005;
-real tmax  = 0.1;
+real dt    = 0.005; 
+real tmax  = 25.0;   
 
 real tol   = 1.e-6;
 real relax = 0.7;
-
-// --- Entropy generation parameters ---
-// Irreversibility distribution ratio (ratio of viscous to thermal
-// entropy generation contribution). Adjust according to your
-// non-dimensionalization (Br/Omega type parameter).
+real relaxWall = 0.3;
 real Phi = 1.0e-3;
 
 // ======================================================================
@@ -38,14 +32,14 @@ real Phi = 1.0e-3;
 
 int n = 80;
 
-border b1(t=-1,1){x=t;  y=-1; label=1;}
-border b2(t=-1,1){x=1;  y=t;  label=2;} // outer wall (cold)
-border b3(t=1,-1){x=t; y=1;   label=3;}
-border b4(t=1,-1){x=-1; y=t;  label=4;} // inner wall (hot)
+border b1(t=-1,1){x=t;  y=-1; label=1;} // bottom wall (hot)
+border b2(t=-1,1){x=1;  y=t;  label=2;} // outer wall (hot)
+border b3(t=1,-1){x=t; y=1;   label=3;} // top wall (cool)
+border b4(t=1,-1){x=-1; y=t;  label=4;} // inner wall (cool)
 
 mesh Th = buildmesh(b1(n) + b2(n) + b3(n) + b4(n));
-
 cout << "Mesh created with " << Th.nv << " vertices and " << Th.nt << " triangles" << endl;
+real hwall = 2.0/n;   
 
 // ======================================================================
 // FE SPACES
@@ -59,6 +53,20 @@ Vh Zeta, ZetaOld, ZetaK;
 Vh Theta, ThetaOld, ThetaK;
 Vh phi;
 Vh U, V, Mag;
+
+// ======================================================================
+//  WALL VORTICITY VIA THOM'S FORMULA
+// ======================================================================
+
+func real ZetaWallThom(real xx, real yy) {
+    real p;
+    if (abs(xx+1.0) < 1.0e-6)      { p = PsiOld(xx+hwall, yy); }   // inner wall  x=-1
+    else if (abs(xx-1.0) < 1.0e-6) { p = PsiOld(xx-hwall, yy); }   // outer wall  x=+1
+    else if (abs(yy+1.0) < 1.0e-6) { p = PsiOld(xx, yy+hwall); }   // bottom wall y=-1
+    else                           { p = PsiOld(xx, yy-hwall); }   // top wall    y=+1
+    real thomVal = -2.0*p/(hwall*hwall);
+    return relaxWall*thomVal + (1.0-relaxWall)*ZetaOld(xx,yy);
+}
 
 // --- New post-processing fields ---
 Vh KE;        // local kinetic energy field (secondary flow), 0.5*(U^2+V^2)
@@ -74,7 +82,7 @@ Vh BeLocal;   // local Bejan number field
 W     = 0.0;
 Psi   = 0.0;
 Zeta  = 0.0;
-Theta = (1.0 - x)/2.0;
+Theta = x - y;   // reference sanjeed paper
 U     = 0.0;
 V     = 0.0;
 Mag   = 0.0;
@@ -92,10 +100,6 @@ ThetaOld = Theta;
 // ======================================================================
 // 10 STRATEGIC PROBE POINTS DEFINITION
 // ======================================================================
-// Format: [X, Y, ID, Name, Description]
-// Reduced from 25 to 10 probes, keeping coverage of: inner wall,
-// outer wall, geometric center, vertical centerline (top/bottom),
-// and the four secondary-flow vortex cores.
 
 int nProbes = 10;
 
@@ -170,11 +174,8 @@ for(int i=0; i<nProbes; i++) {
 // OUTPUT FILES
 // ======================================================================
 
-// File for ALL per-timestep global data in one place (merged from the
-// previously duplicated TimeSeriesData.txt / PerformanceData.txt /
-// EntropyAndEnergyData.txt into a single file)
 ofstream timeStepData("TimeStepData.txt");
-timeStepData << "# Time Wmax PsiMax SecMax NuIn NuOut NuAvg Lambda Wmean KEtot SgenThermalTot SgenFrictionTot SgenTotal BeAvg" << endl;
+timeStepData << "# Time Wmax PsiMax SecMax NuIn NuOut NuAvg Lambda Wmean KEtot SgenThermalTot SgenFrictionTot SgenTotal BeAvg TauAxIn TauAxOut TauAxBot TauAxTop TauSecIn TauSecOut TauSecBot TauSecTop" << endl;
 
 // Files for EACH probe point, written separately (10 files total)
 // Header includes the probe's fixed X,Y location and description.
@@ -240,14 +241,11 @@ for(int i=0; i<nProbes; i++) {
                  << " | " << probeName[i] << " | " << probeDesc[i] << endl;
 }
 
-// (EntropyAndEnergyData.txt removed — merged into TimeStepData.txt above)
 
 // ======================================================================
 // TECPLOT ASCII CONTOUR FILE
 // (velocity, streamline/Psi, vorticity/Zeta, isotherm/Theta,
 //  axial velocity/W, secondary velocity U,V,Mag, KE, entropy, Bejan)
-// One file, multiple zones (one per saved time) so it can be animated
-// directly in Tecplot.
 // ======================================================================
 ofstream tecFile("CurvedDuct_AllFields_Tecplot.dat");
 tecFile << "TITLE = \"Curved Duct - All Fields\"" << endl;
@@ -387,8 +385,6 @@ func int writeProfiles(real time) {
 
 // ======================================================================
 // FUNCTION TO WRITE A TECPLOT ZONE (ALL FIELDS, FE TRIANGLE MESH)
-// Appends one zone (tagged with the solution time) so Tecplot can
-// animate the whole sequence of saved snapshots.
 // ======================================================================
 
 func int writeTecplotZone(real time) {
@@ -464,7 +460,7 @@ solve Axial(W, phi, solver=UMFPACK) =
              + (1.0+delta*x) * (dx(W)*dx(phi) + dy(W)*dy(phi))
              + (dy(PsiK)*dx(W) - dx(PsiK)*dy(W)) * phi
              + (delta/(1.0+delta*x)) * dy(PsiK) * W * phi
-			 + delta* dx(W)* phi
+             - delta* dx(W)* phi   
              + (delta*delta/(1.0+delta*x)) * W * phi )
   - int2d(Th)( (1.0+delta*x)/dt * Wold * phi + Dn * phi )
   + on(1,2,3,4, W=0);
@@ -482,8 +478,8 @@ solve Vorticity(Zeta, phi, solver=UMFPACK) =
   - int2d(Th)( (1.0+delta*x)/dt * ZetaOld * phi
              - Wk * dy(Wk) * phi
              + (1.0+delta*x) * Gr * dx(ThetaK) * phi )
-  + on(1,2,3,4, Zeta=0);
-
+  + on(1,2,3,4, Zeta = ZetaWallThom(x,y));
+  
 // ==============================================================
 //                      STREAM FUNCTION
 // ==============================================================
@@ -502,17 +498,24 @@ solve Energy(Theta, phi, solver=UMFPACK) =
              + (1.0/Pr) * (dx(Theta)*dx(phi) + dy(Theta)*dy(phi))
              - (1.0/Pr) * (delta/(1.0+delta*x)) * dx(Theta) * phi )
   - int2d(Th)( (1.0/dt) * ThetaOld * phi )
-  + on(4, Theta=1.0)
-  + on(2, Theta=0.0);
+  + on(4, Theta = 1)
+  + on(2, Theta = 0);
 
 
-        // ==============================================================
-        // CONVERGENCE CHECK
-        // ==============================================================
+ // ==============================================================
+ // CONVERGENCE CHECK
+ // ==============================================================
         real errW = sqrt(int2d(Th)( (W-Wk)^2 ));
         real errP = sqrt(int2d(Th)( (Psi-PsiK)^2 ));
         real errT = sqrt(int2d(Th)( (Theta-ThetaK)^2 ));
         real err = max(errW, max(errP, errT));
+		
+        if (err != err || err > 1.0e6) {   // err!=err catches NaN
+            cout << "\n!!! DIVERGENCE DETECTED at t=" << time << ", iter=" << iter
+                 << ", err=" << err << " -- stopping run. !!!" << endl;
+            cout << "    Try: smaller dt, smaller relax/relaxWall, or check Dn/Gr/Pr." << endl;
+            exit(1);
+        }
 
         Wk[]     = relax * W[] + (1.-relax) * Wk[];
         PsiK[]   = relax * Psi[] + (1.-relax) * PsiK[];
@@ -543,11 +546,9 @@ solve Energy(Theta, phi, solver=UMFPACK) =
     // ==============================================================
     // MEAN AXIAL VELOCITY AND HYDRAULIC RESISTANCE COEFFICIENT
     // (UNCHANGED, lambda is the friction/hydraulic resistance
-    //  coefficient already present in the original model)
     // ==============================================================
     Area = int2d(Th)(1.0);
-    real WmeanDim = int2d(Th)(W) / Area;
-    Wmean = WmeanDim * sqrt(2.0*delta);
+    Wmean = int2d(Th)(W) / Area;
     lambda = (4.0 * sqrt(2.0*delta) * Dn) / (Wmean * Wmean);
     NuAvg = 0.5 * (NuIn + abs(NuOut));
 
@@ -558,32 +559,36 @@ solve Energy(Theta, phi, solver=UMFPACK) =
 
     // ==============================================================
     // POST-PROCESSING: KINETIC ENERGY FIELD
-    // KE = 0.5*(U^2 + V^2)  -> kinetic energy of secondary flow motion
     // ==============================================================
     KE = 0.5 * (U^2 + V^2);
     KEtot = int2d(Th)( KE );  // domain-integrated (total) kinetic energy
 
     // ==============================================================
     // POST-PROCESSING: LOCAL ENTROPY GENERATION AND BEJAN NUMBER
-    // Thermal irreversibility:
-    //   Ns_th  = (dTheta/dx)^2 + (dTheta/dy)^2
-    // Frictional (viscous) irreversibility (curvilinear metric terms
-    // consistent with the (1+delta*x) curvature factor used above):
-    //   Ns_fr  = Phi * [ 2*(dU/dx)^2 + 2*(dV/dy)^2 + (dU/dy+dV/dx)^2 ]
-    // Total entropy generation number:
-    //   Ns_tot = Ns_th + Ns_fr
-    // Local Bejan number:
-    //   Be = Ns_th / Ns_tot   (Be -> 1 : heat-transfer dominated,
-    //                          Be -> 0 : fluid-friction dominated)
     // ==============================================================
+	
     NsThermal  = dx(Theta)^2 + dy(Theta)^2;
-    NsFriction = Phi * ( 2.0*dx(U)^2 + 2.0*dy(V)^2 + (dy(U)+dx(V))^2 );
+    NsFriction = Phi * ( 2.0*dx(U)^2 + 2.0*delta*delta*U^2/(1.0+delta*x)^2 + 2.0*dy(V)^2
+                        + (dy(U)+dx(V))^2
+                        + (1.0/(2.0*delta)) * ( (dx(W) - delta*W/(1.0+delta*x))^2 + dy(W)^2 ) );
     NsTotal    = NsThermal + NsFriction;
     BeLocal    = NsThermal / (NsTotal + 1.0e-12);  // small eps avoids /0
 
     SgenThermalTot  = int2d(Th)( NsThermal );
     SgenFrictionTot = int2d(Th)( NsFriction );
     SgenTotalGlobal = SgenThermalTot + SgenFrictionTot;
+
+    // ==============================================================
+    //  WALL SHEAR STRESS / SKIN FRICTION
+    // ==============================================================
+    real tauAxialInner  = int1d(Th,4)( -dx(W) ) / int1d(Th,4)(1.0);   // x=-1
+    real tauAxialOuter  = int1d(Th,2)(  dx(W) ) / int1d(Th,2)(1.0);   // x=+1
+    real tauAxialBottom = int1d(Th,1)( -dy(W) ) / int1d(Th,1)(1.0);   // y=-1
+    real tauAxialTop    = int1d(Th,3)(  dy(W) ) / int1d(Th,3)(1.0);   // y=+1
+    real tauSecInner    = int1d(Th,4)( -dx(V) ) / int1d(Th,4)(1.0);   // wall-tangential = V on x=const walls
+    real tauSecOuter    = int1d(Th,2)(  dx(V) ) / int1d(Th,2)(1.0);
+    real tauSecBottom   = int1d(Th,1)( -dy(U) ) / int1d(Th,1)(1.0);   // wall-tangential = U on y=const walls
+    real tauSecTop      = int1d(Th,3)(  dy(U) ) / int1d(Th,3)(1.0);
     BeAvgGlobal     = SgenThermalTot / (SgenTotalGlobal + 1.0e-12);
 
     // ==============================================================
@@ -599,7 +604,7 @@ solve Energy(Theta, phi, solver=UMFPACK) =
     // ==============================================================
     // WRITE PROFILES (every 200 steps)
     // ==============================================================
-    if(step % 200 == 0 && step > 0) {
+    if(step % 1 == 0 && step > 0) {
         writeProfiles(time);
         writeTecplotZone(time);
     }
@@ -627,7 +632,9 @@ solve Energy(Theta, phi, solver=UMFPACK) =
                  << NuIn << " " << NuOut << " " << NuAvg << " "
                  << lambda << " " << Wmean << " "
                  << KEtot << " " << SgenThermalTot << " " << SgenFrictionTot << " "
-                 << SgenTotalGlobal << " " << BeAvgGlobal << endl;
+                 << SgenTotalGlobal << " " << BeAvgGlobal << " "
+                 << tauAxialInner << " " << tauAxialOuter << " " << tauAxialBottom << " " << tauAxialTop << " "
+                 << tauSecInner << " " << tauSecOuter << " " << tauSecBottom << " " << tauSecTop << endl;
 
     // ==============================================================
     // SCREEN OUTPUT WITH PROBE POINTS
@@ -833,8 +840,12 @@ plot(W,        fill=1, value=1, nbiso=30, wait=0, WindowIndex=0, cmm="Final Axia
 plot(Psi,      fill=1, value=1, nbiso=30, wait=0, WindowIndex=1, cmm="Final Stream Function Psi");
 plot(Zeta,     fill=1, value=1, nbiso=30, wait=0, WindowIndex=2, cmm="Final Vorticity Zeta");
 plot(Theta,    fill=1, value=1, nbiso=30, wait=0, WindowIndex=3, cmm="Final Temperature Theta");
-plot(Mag,      fill=1, value=1, nbiso=30, wait=0, WindowIndex=4, cmm="Final Secondary Flow Magnitude");
-plot(KE,       fill=1, value=1, nbiso=30, wait=0, WindowIndex=5, cmm="Final Kinetic Energy");
-plot(NsTotal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=6, cmm="Final Total Entropy Generation");
-plot(BeLocal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=7, cmm="Final Bejan Number");
-plot([U,V],    coef=0.05, wait=1, WindowIndex=8, cmm="Final Secondary Flow Vectors");
+// plot(Mag,      fill=1, value=1, nbiso=30, wait=0, WindowIndex=4, cmm="Final Secondary Flow Magnitude");
+// plot(KE,       fill=1, value=1, nbiso=30, wait=0, WindowIndex=5, cmm="Final Kinetic Energy");
+// plot(NsTotal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=6, cmm="Final Total Entropy Generation");
+// plot(BeLocal,  fill=1, value=1, nbiso=30, wait=0, WindowIndex=7, cmm="Final Bejan Number");
+// plot([U,V],    coef=0.05, wait=1, WindowIndex=8, cmm="Final Secondary Flow Vectors");
+
+
+// ==========================================================================================
+// =================================END OF THE CODE =========================================
